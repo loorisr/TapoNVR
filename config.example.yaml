@@ -1,0 +1,194 @@
+server:
+  host: 0.0.0.0
+  port: 8971
+  # No TLS in the app by design: terminate TLS at a reverse proxy (Caddy/Nginx)
+  # and forward plain HTTP to 127.0.0.1:8971 with X-Forwarded-For/Proto set.
+  # Pass Basic auth through untouched; the session cookie is SameSite=Lax.
+  data_dir: ./data
+  # Days of recordings to keep. Older detections (files + DB rows + S3 objects)
+  # are pruned at startup and then once a day. Use 0 (or a negative value) to
+  # keep everything and never prune - 0 does NOT mean "delete everything".
+  retention_days: 7
+  # REQUIRED for motion detection: an HTTP URL the cameras can reach and POST
+  # ONVIF motion notifications to (the "webhook"). Must be plain HTTP (Tapo
+  # cameras do not support HTTPS webhooks) and reachable from every camera —
+  # i.e. the NVR's LAN IP on the same/via a routable subnet, NOT a loopback or
+  # docker interface. If unset, the LAN IP of the default-route interface is
+  # derived. Example: http://192.168.10.10:8971/onvif/notify
+  # onvif_notify_url: http://192.168.10.10:8971/onvif/notify
+  # Optional shared secret gating the ONVIF webhook (cameras cannot do Basic
+  # auth). When empty, a stable token derived from auth.password is used, and
+  # the auto-derived callback URL above gains a "/<token>" suffix — copy the
+  # exact URL from the startup log ("onvif motion via webhook subscribed")
+  # into the camera. If you set onvif_notify_url explicitly, the "/<token>"
+  # suffix is appended automatically when a token is configured (you may
+  # also append it yourself — a duplicate suffix is not added twice; find
+  # the token in that same startup log line).
+  # onvif_notify_token: change-me-to-something-long
+  # Server log verbosity: debug, info, warn, error.
+  log_level: info
+  auth:
+    username: admin
+    password: changeme
+    # Set disabled: true to explicitly allow an open UI with no password
+    # (e.g. behind a trusted reverse proxy doing its own auth). Default false:
+    # when password is empty and disabled is not true, the server refuses to
+    # start rather than silently exposing an open UI.
+    # disabled: false
+
+stream:
+  go2rtc_path: /usr/bin/go2rtc
+  port: 18884
+  # RTSP re-broadcast port recording pulls from (rtsp://127.0.0.1:rtsp_port/camN).
+  rtsp_port: 8554
+  # go2rtc log verbosity (trace, debug, info, warn, error). Shown in console.
+  go2rtc_log_level: warn
+  # Optional WebRTC ICE servers (empty by default: LAN/host candidates only,
+  # no public STUN contacted). Remote/NAT setups may add e.g.
+  # ice_servers: ["stun:stun.example.com:3478"]
+  # ice_servers: []
+
+record:
+  mode: buffer
+  # Master switch for clip recording. Disable to only save snapshots.
+  enabled: true
+  # Per-type retention overrides (days, optional): a type listed here is
+  # pruned after its own window instead of retention_days above
+  # (e.g. motion: 3 keeps motion 3 days, person: 30 keeps person 30 days).
+  # Absent types and values <= 0 fall back to retention_days. Locked
+  # recordings are never pruned by either rule.
+  # retention_by_type:
+  #   motion: 3
+  #   person: 30
+  # Time window recorded around the detection: pre_detection seconds before
+  # the event (from the rolling buffer) and post_detection seconds after the
+  # event (post timer starts only once the camera reports the detection as inactive).
+  pre_detection: 10
+  post_detection: 10
+  # The rolling buffer is written to RAM (/dev/shm) by default so it never wears
+  # the disk; set an explicit path to keep it elsewhere (e.g. on disk).
+  buffer_dir: ""
+  # Snapshot capture. Disable to stop saving stills (recording still works).
+  # count: total snapshots per detection (primary + extras). At least
+  # interval_s is enforced between two shots, even when a grab overruns the
+  # schedule. count: -1 shoots continuously at interval_s while the camera
+  # reports the motion as active (capped at 60 shots / 180s).
+  snapshots:
+    enabled: true
+    count: 3
+    interval_s: 2
+
+storage:
+  enabled: false
+  # Disk guard (0 = off): when data_dir's filesystem breaches either
+  # threshold, oldest unlocked detections are pruned until back under.
+  # max_disk_pct: 90
+  # min_free_gb: 1
+  s3:
+    endpoint: http://localhost:9000
+    region: us-east-1
+    bucket: taponvr
+    access_key: minioadmin
+    secret_key: minioadmin
+    prefix: recordings
+    # Storage class applied to every upload (default ONEZONE_IA).
+    storage_class: ONEZONE_IA
+
+alerts:
+  pushover:
+    enabled: false
+    app_token: APPTOKEN
+    user_key: USERKEY
+    min_interval_s: 30
+    # Attach a compressed copy of the detection snapshot (false = text-only).
+    send_snapshot: true
+    # Long edge of the attached copy in pixels (0 = original size).
+    snapshot_max_px: 1280
+    # JPEG quality 1-100 of the attached copy (stored snapshot untouched).
+    snapshot_quality: 70
+
+mqtt:
+  enabled: false
+  # broker: tcp://localhost:1883  or host:port  (plain TCP, e.g. 192.168.1.10:1883)
+  broker: ""
+  port: 1883
+  username: ""
+  password: ""
+  client_id: taponvr
+  topic_prefix: taponvr
+  # Public origin of the NVR web UI, e.g. http://192.168.1.10:8971.
+  # Event/detection payloads always carry relative snapshot_url/clip_url
+  # (/api/detections/{id}/snapshot, .../clip); when base_url is set they also
+  # carry absolute snapshot_absolute_url/clip_absolute_url (+ snapshots_absolute).
+  # When unset, the origin of server.onvif_notify_url is used as fallback.
+  # base_url: http://192.168.1.10:8971
+
+# Optional snapshot analysis via an external YOLO HTTP API (NVR Vision).
+# Snapshot in, detections out. Disabled by default (zero impact when off).
+# Analysis is async after the snapshot is written and degraded-silent on
+# failure (detection kept with its camera-side type, vision_error set).
+vision:
+  enabled: false
+  # Base URL of the vision API (no trailing /). In compose use http://yolo:8080.
+  url: http://127.0.0.1:8080
+  # API key sent as X-API-Key when non-empty (empty = open LAN mode).
+  api_key: ""
+  # Per-request timeout in seconds (2..30).
+  timeout_s: 10
+  # Default ?min_conf= (0..1).
+  min_conf: 0.25
+  # CSV COCO filter, empty = all (e.g. "person,car,bicycle").
+  classes: ""
+  # Which snapshots to analyze: primary (default) or all (primary + extras).
+  snapshots: primary
+  # Max concurrent /v1/detect calls (1..8, keeps the ORT pool responsive).
+  max_workers: 2
+
+# Where detections come from.
+#   onvif (default): the camera POSTs ONVIF motion/person/vehicle/pet events to
+#                    the webhook. Gives the type but NOT the bounding box.
+#   rtsp:            the camera's AI boxes + type are read from the H.264 SEI
+#                    metadata inside the RTSP stream (no re-encode, pure Go).
+#                    Gives the type AND the box, and works even when the ONVIF
+#                    webhook is unreliable. See rtsp-detection-boxes.md.
+#   both:            read both and merge them (same detection is grouped once).
+# Per-camera override: cameras[].detection_source (onvif|rtsp|both|off).
+detection:
+  source: onvif
+  rtsp:
+    # RTSP transport used by the SEI reader (tcp|udp). TCP is more reliable.
+    transport: tcp
+    # Minimum delay between two emitted detections of the same type on one
+    # camera. SEI markers repeat on nearly every frame (and on idle scenes), so
+    # this prevents a raw-event/recording flood.
+    debounce_s: 10
+    # Keep a detection "active" for this long after the last box; it ends the
+    # clip's post-detection window (like an ONVIF inactive event).
+    hold_s: 2
+    # Detection types to accept: motion, person, vehicle, pet, other.
+    types: [motion, person, vehicle, pet]
+    # Pull the local go2rtc relay instead of opening a second direct camera
+    # RTSP connection (recommended).
+    use_go2rtc: true
+
+cameras:
+  - name: camera-1
+    # Optional, defaults to true when omitted.
+    enabled: true
+    onvif:
+      url: http://192.0.2.10/onvif
+      username: admin
+      password: change-me
+    rtsp_url: rtsp://admin:change-me@192.0.2.10/h264Preview_01_main
+    ptz: auto
+    # Optional per-camera detection source override (onvif|rtsp|both|off).
+    # Empty inherits detection.source. Example: this camera's boxes are read
+    # from RTSP while others stay on the ONVIF webhook.
+    # detection_source: rtsp
+    # Optional per-camera SEI tuning overrides (inherit detection.rtsp.*).
+    # debounce: min gap between two detections of the same type (0..3600s).
+    # hold: keep "active" this long after the last box (1..60s).
+    # Editable at runtime in the web UI (Live tile) via
+    # GET/POST /api/cameras/{id}/detection.
+    # detection_debounce_s: 10
+    # detection_hold_s: 2

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TapoNVR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>TapoNVR</h1>
+    <span id="clockTxt" class="mono" title="local time"></span>
+    <button id="detToggle" class="det-on" hidden>Detection: ON</button>
+    <button id="recToggle" class="det-on" hidden>Clip: ON</button>
+    <button id="snapToggle" class="det-on" hidden>Snap: ON</button>
+    <button id="s3Toggle" class="det-on" hidden>S3: ON</button>
+    <button id="pushToggle" class="det-on" hidden>Push: ON</button>
+    <button id="visionToggle" class="det-on" hidden>Vision: OFF</button>
+  </header>
+
+  <div class="app-layout">
+    <nav class="vtabs" id="vtabs">
+      <button data-tab="live" class="vtab active">● Live view</button>
+      <button data-tab="events" class="vtab">📋 Event list</button>
+      <button data-tab="recordings" class="vtab">🎞 Recordings</button>
+      <button data-tab="status" class="vtab">⚙ Status</button>
+    </nav>
+    <div class="vcontent" id="vcontent">
+      <div id="tab-live">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <h2 class="section-title" style="margin:0">Live view</h2>
+          <label class="meta" style="font-size:12px">Stream:
+            <select id="streamMode" class="btn-sm" style="margin-left:4px">
+              <option value="auto">Auto</option>
+              <option value="webrtc">WebRTC</option>
+              <option value="mse">MSE</option>
+            </select>
+          </label>
+          <label class="meta" style="font-size:12px" title="Draw the camera's own detection boxes (RTSP SEI) over the live video. Latency compensation: localStorage liveBoxesDelay (ms, default 200).">
+            <input type="checkbox" id="boxesToggle" checked style="vertical-align:middle"> Boxes
+          </label>
+        </div>
+        <div id="gridBody" class="grid"></div>
+      </div>
+      <div id="tab-events" hidden>
+        <h2 class="section-title">Event list <span class="meta" style="font-size:12px;text-transform:none;letter-spacing:0">all ONVIF events from cameras</span></h2>
+        <div id="elist" class="dtable-wrap"></div>
+        <div class="meta" style="padding:8px 4px;font-size:11px">Event list shows <b>all raw ONVIF events</b> (a motion can produce a dozen lines). Recordings shows <b>grouped clips</b>: first event starts a clip, any further event before last+post extends the same clip.</div>
+      </div>
+      <div id="tab-recordings" hidden>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <h2 class="section-title" style="margin:0">Recordings</h2>
+          <div class="htabs" id="rectabs">
+            <button data-view="table" class="tab active">Table</button>
+            <button data-view="grid" class="tab">Grid</button>
+          </div>
+        </div>
+        <span style="font-size:12px;color:#9da7b3" id="detCount"></span>
+        <button id="s3retry" class="btn-sm" style="margin-left:8px" title="Re-upload recordings still pending (S3)">☁️ Retry S3 upload</button>
+        <button id="expRec" class="btn-sm" style="margin-left:8px" title="Export filtered recordings table as CSV">⬇ Export CSV</button>
+        <button id="delAll" class="del-btn" style="margin-left:8px">Delete all</button>
+        <div id="dlist" class="dtable-wrap"></div>
+        <div id="recGrid" class="recordings-grid" hidden></div>
+      </div>
+      <div id="tab-status" hidden>
+        <h2 class="section-title">Status</h2>
+        <div id="sysStatus" class="stat-grid"></div>
+        <h2 class="section-title">Stats</h2>
+        <div id="sysStats" class="stat-grid"></div>
+        <h2 class="section-title">Cameras</h2>
+        <div id="sysCams" class="dtable-wrap"></div>
+      </div>
+      <section id="detail" hidden>
+        <h2 id="dtitle"></h2>
+        <button id="delDetail" class="del-btn">Delete</button>
+        <div id="dsnaps"></div>
+        <video id="dclip" controls></video>
+        <div id="dmeta"></div>
+      </section>
+    </div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

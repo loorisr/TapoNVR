@@ -1,0 +1,112 @@
+services:
+  taponvr:
+    build: .
+    image: taponvr:latest
+    container_name: taponvr
+    restart: unless-stopped
+    # Run as the invoking host user so bind-mounted ./data files are owned by
+    # you, not by the image default UID 65532. Pass your IDs at startup:
+    #   UID=$(id -u) GID=$(id -g) docker compose up -d --build
+    # (defaults to 1000:1000 when UID/GID are unset).
+    # Fix host ownership once: mkdir -p data && chown -R $(id -u):$(id -g) data
+    # (without this you get "permission denied" / "readonly database" in the log).
+    # Alternative: use the named volume below, which inherits image ownership.
+    user: "${UID:-1000}:${GID:-1000}"
+    # Hardening: read-only rootfs, no privileges, drop all caps.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # tmpfs for writable paths required with read_only rootfs
+    tmpfs:
+      # 512M RAM disk: the rolling pre-event buffer segments live here (fast,
+      # never written to flash). 256M starved multi-camera setups (several
+      # parallel segments + go2rtc transcodes) and stalled recordings.
+      - /dev/shm:size=512M,mode=1777
+      - /tmp:size=64M,mode=1777,noexec,nosuid
+    ports:
+      # Web UI + API + ONVIF webhook
+      - "8971:8971"
+      # WebRTC (go2rtc's only externally-bound listener; needs TCP + UDP).
+      # The go2rtc API (stream.port, 18884) and RTSP relay (stream.rtsp_port,
+      # 8554) bind 127.0.0.1 in the generated go2rtc config, so publishing them
+      # would never receive traffic (Docker DNATs to the container IP). They are
+      # loopback-only on purpose: the API config carries camera credentials and
+      # recording pulls the relay internally via rtsp://127.0.0.1:8554/camN.
+      - "8555:8555"
+      - "8555:8555/udp"
+    volumes:
+      # Mount your edited config (copy from config.example.yaml first)
+      - ./config.yaml:/app/config.yaml:ro
+      # Persist detections, snapshots, clips and db.sqlite (writable despite read_only)
+      # Recommended: named volume avoids host UID mismatch entirely
+      - taponvr-data:/app/data
+      # Alternative bind-mount (uncomment, comment named volume above):
+      #- ./data:/app/data  # then: mkdir -p data && chown -R $(id -u):$(id -g) data
+      # Note: the generated go2rtc.yaml lives in /tmp (tmpfs, see tmpfs above),
+      # not in /app/data — it is rewritten on every start, nothing to persist.
+    environment:
+      TZ: Europe/Paris
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/taponvr", "--healthcheck", "--config", "/app/config.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --- Optional: YOLO vision API (NVR Vision, snapshot analysis) ---
+  # Uncomment to analyze snapshots with YOLO and set in config.yaml:
+  #   vision.enabled: true
+  #   vision.url: http://yolo:8080
+  # Analysis is async + degraded-silent (works without it, badges appear when up).
+  # yolo:
+  #   image: nvr-vision:latest
+  #   container_name: taponvr-yolo
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./models_custom:/models_custom:ro
+  #   environment:
+  #     ADDR: :8080
+  #     MODEL_PATH: /models/yolo26n.onnx
+  #     MIN_CONF: 0.25
+  #     POOL_SIZE: 1
+  #     INTRA_THREADS: 4
+  #     # API_KEY: change-me  # empty = open LAN mode
+
+  # --- Optional: MQTT broker (e.g. for Home Assistant) ---
+  # Uncomment if you want a local broker and set mqtt.broker: mqtt:1883 in config.yaml
+  # mqtt:
+  #   image: eclipse-mosquitto:2
+  #   container_name: taponvr-mqtt
+  #   restart: unless-stopped
+  #   ports:
+  #     - "1883:1883"
+  #     - "9001:9001"
+  #   volumes:
+  #     - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+  #     - mosquitto-data:/mosquitto/data
+  #     - mosquitto-log:/mosquitto/log
+
+  # --- Optional: S3-compatible storage (MinIO) ---
+  # Uncomment if you use storage.enabled with a local S3
+  # minio:
+  #   image: minio/minio:latest
+  #   container_name: taponvr-minio
+  #   restart: unless-stopped
+  #   command: server /data --console-address ":9001"
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   environment:
+  #     MINIO_ROOT_USER: minioadmin
+  #     MINIO_ROOT_PASSWORD: minioadmin
+  #   volumes:
+  #     - minio-data:/data
+volumes:
+  taponvr-data:
+#   mosquitto-data:
+#   mosquitto-log:
+#   minio-data:
