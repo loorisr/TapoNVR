@@ -8,14 +8,14 @@ require (
 	github.com/bluenviron/mediacommon/v2 v2.9.6
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/minio/minio-go/v7 v7.4.1
-	github.com/pion/rtp v1.10.5
+	github.com/pion/rtp v1.10.6
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.60.1
+	modernc.org/sqlite v1.61.0
 )
 
 require (
 	github.com/Eyevinn/mp4ff v0.60.0 // indirect
-	github.com/abema/go-mp4 v1.7.3 // indirect
+	github.com/abema/go-mp4 v1.7.4 // indirect
 	github.com/asticode/go-astikit v0.59.0 // indirect
 	github.com/asticode/go-astits v1.16.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -33,7 +33,7 @@ require (
 	github.com/philhofer/fwd v1.2.1 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/rtcp v1.2.19 // indirect
+	github.com/pion/rtcp v1.2.20 // indirect
 	github.com/pion/sdp/v3 v3.0.20 // indirect
 	github.com/pion/srtp/v3 v3.1.3 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
