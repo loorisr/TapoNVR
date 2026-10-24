@@ -488,7 +488,7 @@ tests (synthetic metadata, no camera needed).
 
 What it covers:
 
-- **Go modules** (`go.mod` / `go.sum`), verified with `go build ./...`,
+- **Go modules** (`go.mod` / `go.sum`), verified with `go build -o /dev/null ./src`,
   `go vet ./...` and `go test ./src -count=1`.
 - **Dockerfile base images:** `golang:X-alpine`, `alpine:3.x` and the
   `# syntax=docker/dockerfile:1.x` directive (resolved via Docker Hub; highest

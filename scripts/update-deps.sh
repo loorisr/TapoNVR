@@ -122,7 +122,7 @@ if [ "$DO_GO" -eq 1 ]; then
     ok "go.mod/go.sum updated"
     if [ "$SKIP_VERIFY" -eq 0 ]; then
       log "Go: verifying (build + vet + test)"
-      go build ./...
+      go build -o /dev/null ./src
       go vet ./...
       go test ./src -count=1
       ok "go build + vet + test green"
