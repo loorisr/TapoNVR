@@ -1,5 +1,5 @@
 # Builds the distroless TapoNVR image and publishes it to GitHub Container
-# Registry (ghcr.io/<owner>/<repo>) on every push to master, on version tags
+# Registry (ghcr.io/<owner>/<repo>) on every push to main, on version tags
 # (v*), and on manual dispatch. No secrets to configure: uses GITHUB_TOKEN
 # (needs no extra setup; the `packages: write` permission below is what
 # grants the push). First push creates the package (private by default —
@@ -8,7 +8,7 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
