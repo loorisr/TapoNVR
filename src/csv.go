@@ -60,7 +60,7 @@ func serveDetectionsCSV(app *App, w http.ResponseWriter, r *http.Request) {
 	var qv = r.URL.Query()
 	var label = strings.TrimSpace(qv.Get("label"))
 	var hasVision = qv.Get("has_vision") == "1" || strings.EqualFold(qv.Get("has_vision"), "true")
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, locked, uploaded FROM detections"
+	var q = "SELECT id, camera_id, name, det_type, det_types, confidence, started_at, ended_at, snapshot_path, clip_path, locked, uploaded FROM detections"
 	var cond []string
 	if from > 0 {
 		cond = append(cond, "started_at >= ?")
@@ -72,7 +72,7 @@ func serveDetectionsCSV(app *App, w http.ResponseWriter, r *http.Request) {
 		cond = append(cond, "(camera_id = ? OR name = ?)")
 	}
 	if ty != "" {
-		cond = append(cond, "det_type = ?")
+		cond = append(cond, "(det_type = ? OR instr(','||COALESCE(det_types,'')||',', ','||?||',') > 0)")
 	}
 	if hasVision {
 		cond = append(cond, "vision_count > 0")
@@ -95,19 +95,19 @@ func serveDetectionsCSV(app *App, w http.ResponseWriter, r *http.Request) {
 		args = append(args, cam, cam)
 	}
 	if ty != "" {
-		args = append(args, ty)
+		args = append(args, ty, ty)
 	}
 	if label != "" {
 		var like = "%" + likeEscape(label) + "%"
 		args = append(args, like, like)
 	}
 	type detRow struct {
-		id, cameraID, camName, detType, snap, clip string
-		conf                                       float64
-		startedAt, endedAt                         int64
-		locked, uploaded                           int64
+		id, cameraID, camName, detType, detTypes, snap, clip string
+		conf                                                 float64
+		startedAt, endedAt                                   int64
+		locked, uploaded                                     int64
 	}
-	var header = []string{"id", "camera_id", "camera_name", "type", "confidence", "started_at_unix", "started_at_local", "ended_at_unix", "ended_at_local", "duration_s", "size_bytes", "locked", "uploaded", "snapshot", "clip"}
+	var header = []string{"id", "camera_id", "camera_name", "type", "types", "confidence", "started_at_unix", "started_at_local", "ended_at_unix", "ended_at_local", "duration_s", "size_bytes", "locked", "uploaded", "snapshot", "clip"}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+csvFileName("recordings")+"\"")
 	w.WriteHeader(200)
@@ -136,7 +136,7 @@ func serveDetectionsCSV(app *App, w http.ResponseWriter, r *http.Request) {
 		var rows []detRow
 		for rs.Next() {
 			var dr detRow
-			if serr := rs.Scan(&dr.id, &dr.cameraID, &dr.camName, &dr.detType, &dr.conf, &dr.startedAt, &dr.endedAt, &dr.snap, &dr.clip, &dr.locked, &dr.uploaded); serr != nil {
+			if serr := rs.Scan(&dr.id, &dr.cameraID, &dr.camName, &dr.detType, &dr.detTypes, &dr.conf, &dr.startedAt, &dr.endedAt, &dr.snap, &dr.clip, &dr.locked, &dr.uploaded); serr != nil {
 				rs.Close()
 				return
 			}
@@ -164,11 +164,16 @@ func serveDetectionsCSV(app *App, w http.ResponseWriter, r *http.Request) {
 			// detectionSize stats files per row (one stat per file); keep the
 			// lightweight path: only stat when serving CSV, no vision payload.
 			var totalSize = detectionSize(&Detection{id: dr.id, snapshotPath: dr.snap, clipPath: dr.clip})
+			var types = dr.detTypes
+			if types == "" {
+				types = dr.detType
+			}
 			if _, err := w.Write([]byte(csvRow([]string{
 				dr.id,
 				dr.cameraID,
 				dr.camName,
 				dr.detType,
+				types,
 				strconv.FormatFloat(dr.conf, 'f', 2, 64),
 				strconv.FormatInt(dr.startedAt, 10),
 				csvLocalTime(dr.startedAt),

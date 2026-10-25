@@ -251,6 +251,15 @@ cameras:
   `type` is mapped to the same labels the rest of the app uses (`motion`,
   `person`, `vehicle`, `pet`, `other`). `IPC-DETECTED-BOX` carries no type enum,
   so it is reported as `motion`.
+- **Merged tags.** A single event window often mixes types (motion first, then
+  person/vehicle/pet). Every tag is kept in the detection's `det_types` list and
+  exposed as `types` in the API/UI, while the most specific one becomes the
+  primary `type` (`person`/`vehicle`/`pet` > `other` > `motion`; ties keep the
+  first specific tag). Timelines and raw events still show the per-event tag.
+  `GET /api/detections?type=person` matches any merged tag, and
+  `record.retention_by_type` applies to the primary (promoted) type. A more
+  specific tag arriving after the clip row was inserted republishes the MQTT
+  `detection` payload and sends an extra Pushover notification.
 - **Merging sources.** Set `detection.source: both` to merge webhook and SEI
   detections. Both feed the same grouping path, so a single event window is
   created (the two sources cannot prematurely end each other's active state).
@@ -332,7 +341,7 @@ from the event time).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/detections?camera=&type=` | Detection timeline (`&label=person&has_vision=1` filters YOLO results); each row carries `bbox` (RTSP SEI boxes, `null` when none) |
+| `GET /api/detections?camera=&type=` | Detection timeline (`&label=person&has_vision=1` filters YOLO results); `type` matches any merged tag, and each row carries `type` (primary), `types` (all merged tags) and `bbox` (RTSP SEI boxes, `null` when none) |
 | `GET /api/detections/{id}/snapshot` | Snapshot JPEG |
 | `GET /api/detections/{id}/snapshot?boxes=1` | Snapshot JPEG with boxes burned in (its own YOLO result, else the camera's RTSP SEI boxes; serve-time only, stored file untouched; plain JPEG when neither applies) |
 | `GET /api/detections/{id}/clip` | Clip MP4 |

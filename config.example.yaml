@@ -55,8 +55,10 @@ record:
   # Per-type retention overrides (days, optional): a type listed here is
   # pruned after its own window instead of retention_days above
   # (e.g. motion: 3 keeps motion 3 days, person: 30 keeps person 30 days).
-  # Absent types and values <= 0 fall back to retention_days. Locked
-  # recordings are never pruned by either rule.
+  # Merged detections (e.g. motion + person) use their primary/most specific
+  # tag, so the person window applies once a person was seen. Absent types and
+  # values <= 0 fall back to retention_days. Locked recordings are never pruned
+  # by either rule.
   # retention_by_type:
   #   motion: 3
   #   person: 30

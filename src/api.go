@@ -84,6 +84,12 @@ func detJSON(d *Detection) string {
 	arr = append(arr, kv("camera_id", d.cameraID))
 	arr = append(arr, kv("camera_name", d.camName))
 	arr = append(arr, kv("type", d.detType))
+	// types is the full merged tag list (primary first), e.g. ["person","motion"].
+	var tagJSON []string
+	for _, t := range detectionTags(d) {
+		tagJSON = append(tagJSON, jsonString(t))
+	}
+	arr = append(arr, `"types":[`+strings.Join(tagJSON, ",")+`]`)
 	arr = append(arr, `"confidence":`+fmt.Sprintf("%.2f", d.confidence))
 	arr = append(arr, `"started_at":`+fmt.Sprintf("%d", d.startedAt))
 	arr = append(arr, `"ended_at":`+fmt.Sprintf("%d", d.endedAt))

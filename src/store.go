@@ -96,6 +96,9 @@ func openDB(path string) (*DB, error) {
 		"ALTER TABLE detections ADD COLUMN vision_at INTEGER DEFAULT 0",
 		"ALTER TABLE detections ADD COLUMN vision_snap TEXT DEFAULT ''",
 		"ALTER TABLE detections ADD COLUMN bbox_json TEXT DEFAULT ''",
+		// Merged camera tags per detection (e.g. "motion,person"). det_type
+		// stays the primary/most-specific tag for filters/retention.
+		"ALTER TABLE detections ADD COLUMN det_types TEXT DEFAULT ''",
 	} {
 		if _, err := store.db.Exec(mig); err != nil {
 			logIt(LDEBUG, "db migration skipped", map[string]string{"sql": mig, "error": err.Error()})
@@ -123,7 +126,40 @@ func openDB(path string) (*DB, error) {
 	_, _ = store.db.Exec("ALTER TABLE onvif_events ADD COLUMN bbox_json TEXT DEFAULT ''")
 	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_detections_started ON detections(started_at)")
 	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_detections_camera ON detections(camera_id, started_at)")
+	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_onvif_events_detection ON onvif_events(detection_id)")
+	backfillDetectionTypes(&store)
 	return &store, nil
+}
+
+// backfillDetectionTypes fills det_types for rows created before the column
+// existed, from their linked raw events (fallback: det_type). It deliberately
+// does not rewrite det_type: existing recordings keep their original primary
+// type, only the merged tag list is recovered. One-time no-op afterwards.
+func backfillDetectionTypes(store *DB) {
+	type pending struct {
+		id, primary, events string
+	}
+	var rows []pending
+	var rs, err = store.db.Query(`SELECT d.id, COALESCE(d.det_type,''), COALESCE((SELECT GROUP_CONCAT(DISTINCT e.det_type) FROM onvif_events e WHERE e.detection_id = d.id), '') FROM detections d WHERE COALESCE(d.det_types,'') = ''`)
+	if err != nil {
+		return
+	}
+	for rs.Next() {
+		var p pending
+		if serr := rs.Scan(&p.id, &p.primary, &p.events); serr == nil {
+			rows = append(rows, p)
+		}
+	}
+	rs.Close()
+	// Rows are collected before updating: the pool has a single connection, so
+	// writing while the cursor is open would deadlock.
+	for _, p := range rows {
+		var merged = mergeDetTypeList(p.events, p.primary)
+		if merged == "" {
+			continue
+		}
+		_, _ = store.db.Exec("UPDATE detections SET det_types=? WHERE id=?", merged, p.id)
+	}
 }
 
 func (s *DB) Close() error {
@@ -147,8 +183,115 @@ func dbInsertDetection(store *DB, d *Detection) error {
 	// need an explicit Close to avoid leaking statement handles).
 	// NOTE: legacy s3_snapshot_key/s3_clip_key columns may exist in old DBs;
 	// they are intentionally unwritten (always empty) and unread.
-	_, e := store.db.Exec("INSERT INTO detections(id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, uploaded, s3_expected, size_bytes, bbox_json) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?)", d.id, d.cameraID, d.camName, d.detType, d.confidence, d.startedAt, d.endedAt, d.snapshotPath, d.clipPath, d.s3Expected, d.sizeBytes, d.bboxJSON)
+	var detTypes = d.detTypes
+	if strings.TrimSpace(detTypes) == "" {
+		detTypes = d.detType
+	}
+	_, e := store.db.Exec("INSERT INTO detections(id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, uploaded, s3_expected, size_bytes, bbox_json, det_types) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)", d.id, d.cameraID, d.camName, d.detType, d.confidence, d.startedAt, d.endedAt, d.snapshotPath, d.clipPath, d.s3Expected, d.sizeBytes, d.bboxJSON, detTypes)
 	return e
+}
+
+// ---------------- detection tags (merged group types) -------------
+
+// normalizeDetType lowercases/trims a tag and strips commas so the
+// comma-separated det_types column can never be corrupted.
+func normalizeDetType(t string) string {
+	t = strings.ToLower(strings.TrimSpace(t))
+	return strings.ReplaceAll(t, ",", "")
+}
+
+// parseDetTypes splits a stored det_types value into individual tags.
+func parseDetTypes(raw string) []string {
+	var out []string
+	for _, t := range strings.Split(raw, ",") {
+		if t = normalizeDetType(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// mergeDetTypeList appends every tag from adds (each may itself be a
+// comma-separated list) to existing, de-duplicating and preserving first-seen
+// order. Returns a comma-separated list.
+func mergeDetTypeList(existing string, adds ...string) string {
+	var out []string
+	var seen = map[string]bool{}
+	var addOne = func(raw string) {
+		var t = normalizeDetType(raw)
+		if t == "" || seen[t] {
+			return
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	for _, t := range parseDetTypes(existing) {
+		addOne(t)
+	}
+	for _, add := range adds {
+		for _, t := range parseDetTypes(add) {
+			addOne(t)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// detTypeRank orders tags by specificity for primary-type promotion:
+// person/vehicle/pet > other > motion. Manual media never gets promoted.
+func detTypeRank(t string) int {
+	t = normalizeDetType(t)
+	if strings.HasPrefix(t, "manual-") {
+		return 9
+	}
+	switch t {
+	case "person", "vehicle", "pet":
+		return 3
+	case "other":
+		return 2
+	case "motion":
+		return 1
+	}
+	return 0
+}
+
+// primaryDetType picks the most specific tag from list. Ties keep the current
+// fallback (or the first equally-specific entry), so the first specific tag
+// seen stays primary.
+func primaryDetType(types []string, fallback string) string {
+	var best = normalizeDetType(fallback)
+	var bestRank = detTypeRank(best)
+	for _, t := range types {
+		if r := detTypeRank(t); r > bestRank {
+			best, bestRank = t, r
+		}
+	}
+	if best == "" && len(types) > 0 {
+		best = types[0]
+	}
+	return best
+}
+
+// detectionTags returns the detection's full tag list with the primary tag
+// first, falling back to detType for rows created before det_types existed.
+func detectionTags(d *Detection) []string {
+	if d == nil {
+		return nil
+	}
+	var out []string
+	var seen = map[string]bool{}
+	var add = func(raw string) {
+		var t = normalizeDetType(raw)
+		if t == "" || seen[t] {
+			return
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	add(d.detType)
+	for _, t := range parseDetTypes(d.detTypes) {
+		add(t)
+	}
+	return out
 }
 
 func dbSetUploaded(store *DB, id string) error {
@@ -194,6 +337,39 @@ func dbMergeBBox(store *DB, id, addJSON string) error {
 	return e
 }
 
+// detTypeMergeMtx serializes the read-modify-write merge of det_types/det_type
+// so concurrent extension events cannot lose each other's tags.
+var detTypeMergeMtx sync.Mutex
+
+// dbMergeDetectionType adds dtype to a detection's merged tag list and promotes
+// its primary type when dtype is more specific. found is false when the row
+// does not exist yet (the reserving collectDetection is still capturing
+// snapshots): callers keep the merge in the in-memory grouping slot instead.
+func dbMergeDetectionType(store *DB, id, dtype string) (found bool, promoted bool, err error) {
+	var add = normalizeDetType(dtype)
+	if add == "" {
+		return false, false, nil
+	}
+	detTypeMergeMtx.Lock()
+	defer detTypeMergeMtx.Unlock()
+	var curPrimary, curTypes string
+	err = store.db.QueryRow("SELECT COALESCE(det_type,''), COALESCE(det_types,'') FROM detections WHERE id=?", id).Scan(&curPrimary, &curTypes)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	var merged = mergeDetTypeList(curTypes, add)
+	var primary = primaryDetType(parseDetTypes(merged), curPrimary)
+	var before = detTypeRank(curPrimary)
+	if merged == curTypes && primary == curPrimary {
+		return true, false, nil
+	}
+	_, err = store.db.Exec("UPDATE detections SET det_types=?, det_type=? WHERE id=?", merged, primary, id)
+	return true, detTypeRank(primary) > before, err
+}
+
 func dbSetLocked(store *DB, id string, locked bool) error {
 	var v = 0
 	if locked {
@@ -205,7 +381,7 @@ func dbSetLocked(store *DB, id string, locked bool) error {
 
 // getDetection returns one detection by id, or nil.
 func getDetection(store *DB, id string) (*Detection, error) {
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json FROM detections WHERE id=?"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections WHERE id=?"
 	var rs, e = store.db.Query(q, id)
 	if e != nil {
 		return nil, e
@@ -225,7 +401,8 @@ func getDetection(store *DB, id string) (*Detection, error) {
 		var verr sql.NullString
 		var vat sql.NullInt64
 		var bbox sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox); serr != nil {
+		var dtypes sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -248,6 +425,9 @@ func getDetection(store *DB, id string) (*Detection, error) {
 		if bbox.Valid {
 			d.bboxJSON = bbox.String
 		}
+		if dtypes.Valid {
+			d.detTypes = dtypes.String
+		}
 		out = &d
 	}
 	rs.Close()
@@ -261,7 +441,7 @@ func getDetection(store *DB, id string) (*Detection, error) {
 // operations like delete-all that must not silently skip old rows.
 func listAllDetections(store *DB) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json FROM detections ORDER BY started_at DESC"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections ORDER BY started_at DESC"
 	var rs, e = store.db.Query(q)
 	if e != nil {
 		return nil, e
@@ -281,7 +461,8 @@ func listAllDetections(store *DB) ([]Detection, error) {
 		var verr sql.NullString
 		var vat sql.NullInt64
 		var bbox sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox); serr != nil {
+		var dtypes sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
 			return nil, serr
 		}
 		if extra.Valid {
@@ -302,6 +483,9 @@ func listAllDetections(store *DB) ([]Detection, error) {
 		applyVisionScan(&d, vjson, vcount, vtop, vms, verr, vat)
 		if bbox.Valid {
 			d.bboxJSON = bbox.String
+		}
+		if dtypes.Valid {
+			d.detTypes = dtypes.String
 		}
 		out = append(out, d)
 	}
@@ -373,7 +557,7 @@ func likeEscape(s string) string {
 // the first page stay reachable; countDetectionsFiltered returns the total.
 func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtype string, label string, hasVision bool, limit int, offset int) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json FROM detections"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections"
 	var cond []string
 	if from > 0 {
 		cond = append(cond, "started_at >= ?")
@@ -385,7 +569,7 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		cond = append(cond, "(camera_id = ? OR name = ?)")
 	}
 	if dtype != "" {
-		cond = append(cond, "det_type = ?")
+		cond = append(cond, "(det_type = ? OR instr(','||COALESCE(det_types,'')||',', ','||?||',') > 0)")
 	}
 	if hasVision {
 		cond = append(cond, "vision_count > 0")
@@ -417,7 +601,7 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		args = append(args, camera, camera)
 	}
 	if dtype != "" {
-		args = append(args, dtype)
+		args = append(args, dtype, dtype)
 	}
 	if label != "" {
 		var like = "%" + likeEscape(label) + "%"
@@ -442,7 +626,8 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		var verr sql.NullString
 		var vat sql.NullInt64
 		var bbox sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox); serr != nil {
+		var dtypes sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -464,6 +649,9 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		applyVisionScan(&d, vjson, vcount, vtop, vms, verr, vat)
 		if bbox.Valid {
 			d.bboxJSON = bbox.String
+		}
+		if dtypes.Valid {
+			d.detTypes = dtypes.String
 		}
 		out = append(out, d)
 	}
@@ -489,7 +677,7 @@ func countDetectionsFiltered(store *DB, from int64, to int64, camera string, dty
 		cond = append(cond, "(camera_id = ? OR name = ?)")
 	}
 	if dtype != "" {
-		cond = append(cond, "det_type = ?")
+		cond = append(cond, "(det_type = ? OR instr(','||COALESCE(det_types,'')||',', ','||?||',') > 0)")
 	}
 	if hasVision {
 		cond = append(cond, "vision_count > 0")
@@ -511,7 +699,7 @@ func countDetectionsFiltered(store *DB, from int64, to int64, camera string, dty
 		args = append(args, camera, camera)
 	}
 	if dtype != "" {
-		args = append(args, dtype)
+		args = append(args, dtype, dtype)
 	}
 	if label != "" {
 		var like = "%" + likeEscape(label) + "%"
@@ -685,10 +873,15 @@ func onvifEventJSON(ev *OnvifEvent) string {
 // ---------------- detect: model --------------------------------
 
 type Detection struct {
-	id           string
-	cameraID     string
-	camName      string
-	detType      string
+	id       string
+	cameraID string
+	camName  string
+	detType  string
+	// detTypes is the comma-separated list of every camera tag merged into
+	// this group (e.g. "motion,person"), in first-seen order. detType remains
+	// the primary (most specific) tag; empty on rows created before the column
+	// existed, in which case readers fall back to detType.
+	detTypes     string
 	confidence   float64
 	startedAt    int64
 	endedAt      int64

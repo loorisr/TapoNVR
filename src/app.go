@@ -129,6 +129,12 @@ type activeRec struct {
 	firstAt int64
 	lastAt  int64
 	endAt   int64
+	// detType is the primary (most specific) tag; detTypes is the full merged
+	// comma-separated list. They live on the reservation so tags that arrive
+	// while collectDetection is still capturing snapshots are not lost before
+	// the DB row exists.
+	detType  string
+	detTypes string
 	// established is false while the reserving collectDetection is still
 	// running (its DB row may not exist yet) and true once inserted.
 	// Only established slots get ghost-checked against the DB.
@@ -178,6 +184,22 @@ func setActiveRec(camID string, rec *activeRec) {
 	activeRecMtx.Unlock()
 }
 
+// addActiveRecType merges dtype into the reservation's tag list and promotes
+// its primary type when dtype is more specific. Returns the resulting primary
+// tag and whether it changed to a more specific one. Callers hold groupMtx.
+func addActiveRecType(camID string, id string, dtype string) (primary string, promoted bool) {
+	activeRecMtx.Lock()
+	defer activeRecMtx.Unlock()
+	var r = activeRecMap[camID]
+	if r == nil || r.id != id {
+		return "", false
+	}
+	var before = detTypeRank(r.detType)
+	r.detTypes = mergeDetTypeList(r.detTypes, dtype)
+	r.detType = primaryDetType(parseDetTypes(r.detTypes), r.detType)
+	return r.detType, detTypeRank(r.detType) > before
+}
+
 func extendActiveRec(camID string, now int64, postSec int64) (string, bool) {
 	activeRecMtx.Lock()
 	defer activeRecMtx.Unlock()
@@ -212,7 +234,7 @@ func confirmActiveRec(camID string, id string, endAt int64) {
 		if r.endAt > endAt {
 			endAt = r.endAt
 		}
-		activeRecMap[camID] = &activeRec{id: r.id, firstAt: r.firstAt, lastAt: time.Now().Unix(), endAt: endAt, established: true}
+		activeRecMap[camID] = &activeRec{id: r.id, firstAt: r.firstAt, lastAt: time.Now().Unix(), endAt: endAt, detType: r.detType, detTypes: r.detTypes, established: true}
 		return
 	}
 	if _, ok := activeRecMap[camID]; ok {
@@ -282,7 +304,11 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 	var detID string
 	if !extended {
 		detID = newID()
-		setActiveRec(camID, &activeRec{id: detID, firstAt: now, lastAt: now, endAt: now + postSec})
+		setActiveRec(camID, &activeRec{id: detID, firstAt: now, lastAt: now, endAt: now + postSec, detType: normalizeDetType(dtype), detTypes: normalizeDetType(dtype)})
+	} else {
+		// Merge the tag into the reservation even while the DB row is still
+		// being written by the reserving collectDetection.
+		addActiveRecType(camID, extID, dtype)
 	}
 	groupMtx.Unlock()
 	if extended {
@@ -298,6 +324,20 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		if bbox != "" {
 			if err := dbMergeBBox(app.db, extID, bbox); err != nil {
 				logIt(LWARN, "db bbox merge failed", map[string]string{"error": err.Error()})
+			}
+		}
+		// Merge the tag into the DB row (no-op while the row does not exist
+		// yet: the reserving collectDetection writes the in-memory slot tags).
+		// A more specific tag arriving after the clip was inserted triggers an
+		// extra notification/republish so subscribers see the tag upgrade.
+		if found, promoted, terr := dbMergeDetectionType(app.db, extID, dtype); terr != nil {
+			logIt(LWARN, "db tag merge failed", map[string]string{"error": terr.Error()})
+		} else if found && promoted {
+			if det, derr := getDetection(app.db, extID); derr == nil && det != nil {
+				mqttPublishDetection(det)
+				broadcastDetection(camID, camName, dtype, bbox)
+				go pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, det.snapshotPath)
+				logIt(LINFO, "detection tag promoted", map[string]string{"camera": camName, "id": extID, "type": dtype})
 			}
 		}
 		logIt(LDEBUG, "onvif raw event (grouped)", map[string]string{"camera": camName, "type": dtype, "id": ev.id, "group": extID})

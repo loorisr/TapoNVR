@@ -2018,7 +2018,8 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	d.id = id
 	d.cameraID = camID
 	d.camName = camName
-	d.detType = dtype
+	d.detType = normalizeDetType(dtype)
+	d.detTypes = d.detType
 	d.confidence = 0.9
 	d.startedAt = now - int64(app.cfg.Record.PreDetection)
 	d.endedAt = endedAt
@@ -2047,13 +2048,35 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	// Cache the media size (snapshot now; clip refreshed by assembleClip in
 	// buffer mode, extras refreshed when the burst completes).
 	d.sizeBytes = detectionSize(&d)
+	// Insert while holding the grouping lock: a concurrent extension either
+	// lands in the in-memory slot before this read (and is persisted here) or
+	// waits until the row is established and merges via the DB path. This
+	// closes the reserved-but-uninserted race for merged tags.
+	groupMtx.Lock()
+	if cur := getActiveRec(camID); cur != nil && cur.id == id {
+		if cur.endAt > d.endedAt {
+			d.endedAt = cur.endAt
+		}
+		if cur.detType != "" {
+			d.detType = cur.detType
+		}
+		if cur.detTypes != "" {
+			d.detTypes = cur.detTypes
+		}
+	}
+	if d.detTypes == "" {
+		d.detTypes = d.detType
+	}
 	var derr = dbInsertDetection(app.db, &d)
+	if derr == nil {
+		// Row exists: mark the reserved slot established (keeps any end time
+		// extensions that landed during the slow capture above).
+		confirmActiveRec(camID, id, d.endedAt)
+	}
+	groupMtx.Unlock()
 	if derr != nil {
 		return nil, derr
 	}
-	// Row exists: mark the reserved slot established (keeps any end time
-	// extensions that landed during the slow capture above).
-	confirmActiveRec(camID, id, d.endedAt)
 	// S3 upload + Pushover run in the background: both can block for seconds
 	// (S3 up to minutes on a hung endpoint, Pushover 15s timeout) and must not
 	// stall the ONVIF webhook response or the grouping path. Values are copied
@@ -2093,9 +2116,9 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 		} else {
 			pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, "")
 		}
-	}(app, snap, clipPath, camName, dtype, id, app.cfg.Record.Mode, snapOn, recordOn, src != "")
+	}(app, snap, clipPath, camName, d.detType, id, app.cfg.Record.Mode, snapOn, recordOn, src != "")
 	// Notify connected WebUI clients immediately ("motion detected").
-	broadcastDetection(camID, camName, dtype, bbox)
+	broadcastDetection(camID, camName, d.detType, bbox)
 	mqttPublishDetection(&d)
 	// Vision: async YOLO on the primary snapshot (never blocks clip/S3/push).
 	// Degraded-silent when the API is down (vision_error only).

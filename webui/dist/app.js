@@ -971,7 +971,10 @@ function typeOptions(observed){
 }
 function observedTypes(list, key){
   var s = Object.create(null);
-  (list||[]).forEach(function(d){ var t = d[key||"type"]; if(t) s[t]=1; });
+  (list||[]).forEach(function(d){
+    var ts = (d.types && d.types.length) ? d.types : [d[key||"type"]];
+    (ts||[]).forEach(function(t){ if(t) s[t]=1; });
+  });
   return Object.keys(s);
 }
 function presetRange(name){
@@ -1094,9 +1097,9 @@ function renderEvents(list){
       var map=Object.create(null); var rows=[];
       _lastEventsList.forEach(function(d){
         var gid=d.detection_id||d.group_id||d.groupId||'';
-        if(!gid||gid==='-'){ rows.push({d:d,_gid:'-',_key:d.id,_count:1,_ts:d.created_at||d.started_at}); }
-        else if(!map[gid]){ map[gid]={d:d,_gid:gid,_key:gid,_count:1,_ts:d.created_at||d.started_at}; rows.push(map[gid]); }
-        else { map[gid]._count+=1; var cur=d.created_at||d.started_at; if(cur && map[gid]._ts && cur<map[gid]._ts) map[gid]._ts=cur; }
+        if(!gid||gid==='-'){ rows.push({d:d,_gid:'-',_key:d.id,_count:1,_ts:d.created_at||d.started_at,_types:[d.type]}); }
+        else if(!map[gid]){ map[gid]={d:d,_gid:gid,_key:gid,_count:1,_ts:d.created_at||d.started_at,_types:[d.type]}; rows.push(map[gid]); }
+        else { map[gid]._count+=1; if(d.type && map[gid]._types.indexOf(d.type)<0) map[gid]._types.push(d.type); var cur=d.created_at||d.started_at; if(cur && map[gid]._ts && cur<map[gid]._ts) map[gid]._ts=cur; }
       });
       exportGroupedEventsCSV(rows, expBtn);
     } else {
@@ -1122,10 +1125,10 @@ function renderEvents(list){
     list.forEach(function(d){
       var gid=d.detection_id||d.group_id||d.groupId||'';
       if(!gid||gid==='-'){
-        displayRows.push({d:d,_gid:'-',_key:d.id,_count:1,_ts:d.created_at||d.started_at});
+        displayRows.push({d:d,_gid:'-',_key:d.id,_count:1,_ts:d.created_at||d.started_at,_types:[d.type]});
       } else {
-        if(!map[gid]){ map[gid]={d:d,_gid:gid,_key:gid,_count:1,_ts:d.created_at||d.started_at}; order.push(gid); displayRows.push(map[gid]); }
-        else { map[gid]._count+=1; var cur=d.created_at||d.started_at; if(cur && map[gid]._ts && cur<map[gid]._ts) map[gid]._ts=cur; }
+        if(!map[gid]){ map[gid]={d:d,_gid:gid,_key:gid,_count:1,_ts:d.created_at||d.started_at,_types:[d.type]}; order.push(gid); displayRows.push(map[gid]); }
+        else { map[gid]._count+=1; if(d.type && map[gid]._types.indexOf(d.type)<0) map[gid]._types.push(d.type); var cur=d.created_at||d.started_at; if(cur && map[gid]._ts && cur<map[gid]._ts) map[gid]._ts=cur; }
       }
     });
   } else {
@@ -1143,7 +1146,7 @@ function renderEvents(list){
       if(hasGroup){ tr.style.cursor='pointer'; tr.title='Go to recording '+gid.slice(0,8); tr.onclick=function(){ switchTab('recordings'); api("/api/detections").then(function(all){ var found=null; for(var i=0;i<all.length;i++) if(all[i].id===gid){found=all[i];break;} if(found) showDetail(found,'snapshots'); }).catch(function(){}); }; }
       var tdTime=document.createElement("td"); tdTime.textContent=ts?new Date(ts*1000).toLocaleString():"-";
       var tdName=document.createElement("td"); tdName.textContent=d.camera_name;
-      var tdType=document.createElement("td"); tdType.innerHTML="<span class='badge'>"+esc(detectionLabel(d.type))+"</span>";
+      var tdType=document.createElement("td"); tdType.innerHTML=_eventsGroupBy?detectionBadgesHTML(row._types||[d.type]):("<span class='badge'>"+esc(detectionLabel(d.type))+"</span>");
       var tdGid=document.createElement("td"); tdGid.textContent=hasGroup?gid.slice(0,8):'—'; tdGid.className="mono"; tdGid.title=gid;
       tr.appendChild(tdTime); tr.appendChild(tdName); tr.appendChild(tdType); tr.appendChild(tdGid);
       if(_eventsGroupBy){ var tdCount=document.createElement("td"); tdCount.textContent=row._count; tdCount.className="mono"; tr.appendChild(tdCount); }
@@ -1282,7 +1285,8 @@ function renderRecordingsGrid(list){
     var img;
     if (d.snapshot) { img=document.createElement("img"); _imgFallback(img, "snapshot manquant"); img.src=visionBoxesURL(d, d.snapshot); img.alt="snapshot"; img.loading="lazy"; }
     else { img=document.createElement("div"); img.className="meta"; img.style.cssText="display:flex;align-items:center;justify-content:center;height:100%;min-height:120px"; img.textContent="no snapshot"; }
-    var badge=document.createElement("span"); badge.className="rec-badge badge"; badge.textContent=detectionLabel(d.type);
+    var badge=document.createElement("span"); badge.className="rec-badge"; badge.style.cssText="display:inline-flex;flex-wrap:wrap;gap:4px;max-width:calc(100% - 16px)";
+    sortDetectionTypes(detectionTypeList(d)).forEach(function(t){ var b=document.createElement("span"); b.className="badge"; b.textContent=detectionLabel(t); badge.appendChild(b); });
     thumb.appendChild(img); thumb.appendChild(badge);
     var vb=visionBadgeText(d);
     if(vb){ var vbadge=document.createElement("span"); vbadge.className="rec-badge badge vision-badge"; vbadge.textContent=vb; vbadge.title=(d.vision&&d.vision.error)||"YOLO"; thumb.appendChild(vbadge); }
@@ -1366,6 +1370,30 @@ function detectionLabel(t) {
   return m[t] || t;
 }
 
+// ---------- merged camera tags (detection.types) ----------
+// Specific tags first, motion last; ties keep the server's first-seen order.
+var _detTypeRank = {person:3, vehicle:3, pet:3, other:2, motion:1};
+function detectionTypeList(d){
+  d = d || {};
+  var raw = d.types || [];
+  if(!raw.length && d.type) raw = [d.type];
+  var seen = Object.create(null), out = [];
+  function add(t){ t = String(t||"").trim().toLowerCase(); if(t && !seen[t]){ seen[t]=1; out.push(t); } }
+  if(d.type) add(d.type);
+  raw.forEach(add);
+  return out;
+}
+function sortDetectionTypes(types){
+  return (types||[]).slice().sort(function(a,b){ return (_detTypeRank[b]||0)-(_detTypeRank[a]||0); });
+}
+function detectionBadgesHTML(types){
+  return sortDetectionTypes(types).map(function(t){ return "<span class='badge'>"+esc(detectionLabel(t))+"</span>"; }).join(" ");
+}
+function detectionTagsText(types){
+  return sortDetectionTypes(types).map(detectionLabel).join(" + ");
+}
+function detectionTags(d){ return detectionTagsText(detectionTypeList(d)); }
+
 // ---------- CSV export (recordings + events, filtered rows) ----------
 // Neutralizes spreadsheet formula injection the same way the backend does:
 // a cell starting with =, +, - or @ is evaluated as a formula by Excel.
@@ -1401,12 +1429,12 @@ function exportQueryToCSV(baseQuery, prefix, btn) {
 }
 // Grouped events view is a client-side aggregation: export displayed rows locally.
 function exportGroupedEventsCSV(displayRows, btn) {
-  var header = ["local_date_time", "camera", "type", "group_id", "count"];
+  var header = ["local_date_time", "camera", "type", "types", "group_id", "count"];
   var lines = [header.map(csvEscape).join(",")];
   displayRows.forEach(function (row) {
     var d = row.d || {};
     var ts = row._ts ? new Date(row._ts * 1000).toLocaleString() : "";
-    lines.push([ts, d.camera_name || "", d.type || "", row._gid === "-" ? "" : row._gid, row._count].map(csvEscape).join(","));
+    lines.push([ts, d.camera_name || "", d.type || "", sortDetectionTypes(row._types || [d.type]).join(","), row._gid === "-" ? "" : row._gid, row._count].map(csvEscape).join(","));
   });
   saveBlob(csvName("events-grouped"), new Blob(["\uFEFF" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" }));
 }
@@ -1453,7 +1481,7 @@ function renderDetections(list) {
       else { tdS3.textContent = "—"; tdS3.className = "meta"; tdS3.title = "Not uploaded to S3"; }
       var tdType = document.createElement("td");
       var vb2 = visionBadgeText(d);
-      tdType.innerHTML = "<span class='badge'>" + esc(detectionLabel(d.type)) + "</span>" + (vb2 ? " <span class='badge vision-badge' title='"+esc((d.vision&&d.vision.error)||"YOLO")+"'>" + esc(vb2) + "</span>" : "");
+      tdType.innerHTML = detectionBadgesHTML(detectionTypeList(d)) + (vb2 ? " <span class='badge vision-badge' title='"+esc((d.vision&&d.vision.error)||"YOLO")+"'>" + esc(vb2) + "</span>" : "");
       var tdCam = document.createElement("td");
       tdCam.textContent = d.camera_name || d.camera_id || "";
       var tdGid = document.createElement("td"); tdGid.textContent=(d.id||'').slice(0,8); tdGid.className="mono"; tdGid.title=d.id||'';
@@ -1584,7 +1612,7 @@ function renderTimeline(d, box, tl) {
   tl = tl || {};
   var det = tl.detection || d;
   var entries = [];
-  if (det.started_at) entries.push({t: +det.started_at, icon: "▶", cls: "tl-start", text: "Detection start — " + detectionLabel(det.type)});
+  if (det.started_at) entries.push({t: +det.started_at, icon: "▶", cls: "tl-start", text: "Detection start — " + detectionTags(det)});
   (tl.events || []).forEach(function (e) {
     entries.push({
       t: +e.created_at || +e.started_at, icon: "•", cls: "tl-event",
@@ -1618,7 +1646,7 @@ function renderTimeline(d, box, tl) {
   var foot = document.createElement("div");
   foot.className = "meta tl-foot";
   foot.textContent = "group " + String(det.id || "").slice(0, 8) + " · " +
-    detectionLabel(det.type) + " · " + (det.camera_name || det.camera_id || "");
+    detectionTags(det) + " · " + (det.camera_name || det.camera_id || "");
   box.appendChild(foot);
 }
 
@@ -1773,7 +1801,7 @@ function showDetail(d, mode) {
   curDetail = d;
   curTab = mode || 'snapshots';
   document.getElementById("detail").hidden = false;
-  document.getElementById("dtitle").textContent = d.camera_name + " · " + detectionLabel(d.type) + " · " + new Date(d.started_at * 1000).toLocaleString();
+  document.getElementById("dtitle").textContent = d.camera_name + " · " + detectionTags(d) + " · " + new Date(d.started_at * 1000).toLocaleString();
   document.getElementById("dmeta").textContent =
     "duration " + fmtDuration(d.duration != null ? d.duration : (d.ended_at - d.started_at)) + " · size " + fmtSize(d.size) + " · confidence " + d.confidence + (d.uploaded ? " · ☁️ S3" : "") + (visionBadgeText(d) ? " · " + visionBadgeText(d) : "") + (bboxBadgeText(d) ? " · " + bboxBadgeText(d) : "");
   renderDetailTab();
