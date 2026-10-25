@@ -235,6 +235,10 @@ type PushoverCfg struct {
 	SnapshotMaxPx int `yaml:"snapshot_max_px"`
 	// SnapshotQuality is the JPEG quality (1-100) of the attached copy.
 	SnapshotQuality int `yaml:"snapshot_quality"`
+	// Events lists the detection types that trigger a notification (motion,
+	// person, vehicle, pet, other). Empty or absent means every type, so
+	// existing configs keep notifying on all detections.
+	Events []string `yaml:"events"`
 }
 
 type AlertsCfg struct {
@@ -379,6 +383,10 @@ var detectionLabels = map[string]bool{
 	"motion": true, "person": true, "vehicle": true, "pet": true, "other": true,
 }
 
+// allDetectionTypes is the complete set of detection labels. Used for the
+// Pushover "notify on all types" default.
+var allDetectionTypes = []string{"motion", "person", "vehicle", "pet", "other"}
+
 // sourceHas reports whether an effective source string enables one channel.
 func sourceHas(source, want string) bool {
 	return source == want || source == "both"
@@ -495,6 +503,7 @@ func configDefaults(c *Config) {
 	c.Alerts.Pushover.SendSnapshot = true
 	c.Alerts.Pushover.SnapshotMaxPx = 1280
 	c.Alerts.Pushover.SnapshotQuality = 70
+	c.Alerts.Pushover.Events = slices.Clone(allDetectionTypes)
 	c.Mqtt.Enabled = false
 	c.Mqtt.Broker = ""
 	c.Mqtt.Port = 1883
@@ -697,6 +706,29 @@ func loadConfig(path string) (*Config, error) {
 		configWarn("config clamped: alerts.pushover.snapshot_max_px < 0, using 0", nil)
 		c.Alerts.Pushover.SnapshotMaxPx = 0
 	}
+	// Pushover event filter: normalize labels, drop unknowns and duplicates.
+	// An empty list (or the key absent) means every detection type.
+	var pushEvents = make([]string, 0, len(c.Alerts.Pushover.Events))
+	for _, e := range c.Alerts.Pushover.Events {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if !detectionLabels[e] {
+			configWarn("config: ignoring unknown alerts.pushover.events entry", map[string]string{"type": e})
+			continue
+		}
+		if !slices.Contains(pushEvents, e) {
+			pushEvents = append(pushEvents, e)
+		}
+	}
+	if len(pushEvents) == 0 {
+		if len(c.Alerts.Pushover.Events) > 0 {
+			configWarn("config: alerts.pushover.events has no valid type, using all", nil)
+		}
+		pushEvents = slices.Clone(allDetectionTypes)
+	}
+	c.Alerts.Pushover.Events = pushEvents
 	if c.Vision.TimeoutS < 2 || c.Vision.TimeoutS > 30 {
 		configWarn("config clamped: vision.timeout_s not in 2..30, using 10", nil)
 		c.Vision.TimeoutS = 10

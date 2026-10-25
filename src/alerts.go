@@ -133,16 +133,38 @@ func pushAttachment(p PushoverCfg, snapPath string) []byte {
 	return small
 }
 
-// pushNotify sends a Pushover notification. When send_snapshot is on and
-// snapPath is a non-empty path to a readable JPEG, a compressed copy of the
-// image is attached to the message via multipart/form-data.
+// pushoverEventAllowed reports whether eventType may trigger a notification
+// according to alerts.pushover.events. An empty list allows every type, so
+// configs written before the filter existed keep notifying on all detections.
+func pushoverEventAllowed(p PushoverCfg, eventType string) bool {
+	if len(p.Events) == 0 {
+		return true
+	}
+	var t = strings.ToLower(strings.TrimSpace(eventType))
+	for _, e := range p.Events {
+		if strings.EqualFold(strings.TrimSpace(e), t) {
+			return true
+		}
+	}
+	return false
+}
+
+// pushNotify sends a Pushover notification for a detection event of type
+// eventType. When send_snapshot is on and snapPath is a non-empty path to a
+// readable JPEG, a compressed copy of the image is attached to the message via
+// multipart/form-data. Events not listed in alerts.pushover.events are silently
+// skipped.
 // Sends are throttled to one per Pushover.MinIntervalS seconds (0 disables
 // throttling). Errors are logged and swallowed. The throttle slot is reserved
 // before the send (so concurrent bursts still collapse to one) but rolled back
 // when the send fails, so a failure doesn't silence the next window.
-func pushNotify(app *App, title string, message string, snapPath string) {
+func pushNotify(app *App, eventType string, title string, message string, snapPath string) {
 	var p = app.cfg.Alerts.Pushover
 	if !pushoverEnabled() {
+		return
+	}
+	if !pushoverEventAllowed(p, eventType) {
+		logIt(LDEBUG, "pushover event filtered", map[string]string{"type": eventType, "title": title})
 		return
 	}
 	if strings.TrimSpace(p.AppToken) == "" || strings.TrimSpace(p.UserKey) == "" {

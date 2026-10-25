@@ -177,8 +177,8 @@ func TestPushoverDisabledShortCircuits(t *testing.T) {
 	withToggles(t, func() {
 		setPushoverEnabled(false)
 		app := &App{cfg: &Config{}}
-		app.cfg.Alerts.Pushover.MinIntervalS = 0      // would send for real if reached
-		pushNotify(app, "t", "m", "/nonexistent.jpg") // must return without network
+		app.cfg.Alerts.Pushover.MinIntervalS = 0                // would send for real if reached
+		pushNotify(app, "motion", "t", "m", "/nonexistent.jpg") // must return without network
 	})
 }
 
@@ -648,7 +648,7 @@ func TestPushoverMissingTokensSkips(t *testing.T) {
 		app.cfg.Alerts.Pushover.AppToken = ""
 		app.cfg.Alerts.Pushover.UserKey = ""
 		// Must return without network and without consuming the throttle slot.
-		pushNotify(app, "t", "m", "/nonexistent.jpg")
+		pushNotify(app, "motion", "t", "m", "/nonexistent.jpg")
 		pushRateMtx.Lock()
 		defer pushRateMtx.Unlock()
 		if lastPushUnix != 0 {
@@ -848,5 +848,59 @@ func TestPushoverSnapshotDefaults(t *testing.T) {
 	}
 	if !cfg.Alerts.Pushover.SendSnapshot || cfg.Alerts.Pushover.SnapshotMaxPx != 1280 || cfg.Alerts.Pushover.SnapshotQuality != 70 {
 		t.Fatalf("bad compat defaults: %+v", cfg.Alerts.Pushover)
+	}
+}
+
+func TestPushoverEventsConfig(t *testing.T) {
+	var c Config
+	configDefaults(&c)
+	if got := strings.Join(c.Alerts.Pushover.Events, ","); got != "motion,person,vehicle,pet,other" {
+		t.Fatalf("bad default events: %q", got)
+	}
+	dir := t.TempDir()
+	load := func(name, blob string) *Config {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(blob), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfig(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	// Case/whitespace normalized, duplicates dropped, unknown types ignored.
+	cfg := load("filter.yaml", "alerts:\n  pushover:\n    events: [PERSON, motion, person, bogus]\n")
+	if got := strings.Join(cfg.Alerts.Pushover.Events, ","); got != "person,motion" {
+		t.Fatalf("filtered events=%q want person,motion", got)
+	}
+	// No valid type at all falls back to every detection type.
+	cfg = load("invalid.yaml", "alerts:\n  pushover:\n    events: [bogus]\n")
+	if got := strings.Join(cfg.Alerts.Pushover.Events, ","); got != "motion,person,vehicle,pet,other" {
+		t.Fatalf("invalid filter should fall back to all, got %q", got)
+	}
+	// Explicitly empty also means all (backward-compatible).
+	cfg = load("empty.yaml", "alerts:\n  pushover:\n    events: []\n")
+	if got := strings.Join(cfg.Alerts.Pushover.Events, ","); got != "motion,person,vehicle,pet,other" {
+		t.Fatalf("empty filter should allow all, got %q", got)
+	}
+}
+
+func TestPushoverEventAllowed(t *testing.T) {
+	// Zero value / empty list allows everything.
+	if !pushoverEventAllowed(PushoverCfg{}, "motion") {
+		t.Fatal("empty event list must allow every type")
+	}
+	p := PushoverCfg{Events: []string{"person", "vehicle"}}
+	for _, typ := range []string{"person", " PERSON ", "vehicle"} {
+		if !pushoverEventAllowed(p, typ) {
+			t.Fatalf("event %q should be allowed", typ)
+		}
+	}
+	for _, typ := range []string{"motion", "pet", "other", ""} {
+		if pushoverEventAllowed(p, typ) {
+			t.Fatalf("event %q should be filtered", typ)
+		}
 	}
 }

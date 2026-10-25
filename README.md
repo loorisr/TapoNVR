@@ -158,7 +158,7 @@ See `config.example.yaml` for the full file. Key settings:
 | `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent) |
 | `detection.source` | `onvif` (webhook, type only — default), `rtsp` (camera AI boxes + type from H.264 SEI), or `both` |
 | `detection.rtsp.*` | SEI reader tuning: `transport`, `debounce_s`, `hold_s`, `types`, `use_go2rtc` |
-| `alerts.pushover.*` | Pushover notifications (`send_snapshot` attaches a compressed copy; oversized copies fall back to text-only) |
+| `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; oversized copies fall back to text-only) |
 
 ### Camera
 
@@ -468,7 +468,8 @@ curl -u admin:change-me -X POST http://localhost:8971/api/test/detection
 ```
 
 This writes a snapshot + clip, records a detection row, uploads to S3 (if
-enabled) and sends a Pushover alert (if enabled).
+enabled) and sends a Pushover alert (if enabled and `motion` is in
+`alerts.pushover.events`).
 
 For RTSP detection, watch the startup log for `rtsp detection reader started` /
 `rtsp detection connected`, and the Status tab for the per-camera source and RTSP

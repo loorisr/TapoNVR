@@ -2089,9 +2089,9 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 			}
 		}
 		if snapOn {
-			pushNotify(app, "Detection: "+camName, dtype+" detected on "+camName, snap)
+			pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, snap)
 		} else {
-			pushNotify(app, "Detection: "+camName, dtype+" detected on "+camName, "")
+			pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, "")
 		}
 	}(app, snap, clipPath, camName, dtype, id, app.cfg.Record.Mode, snapOn, recordOn, src != "")
 	// Notify connected WebUI clients immediately ("motion detected").

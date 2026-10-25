@@ -106,6 +106,10 @@ alerts:
     snapshot_max_px: 1280
     # JPEG quality 1-100 of the attached copy (stored snapshot untouched).
     snapshot_quality: 70
+    # Detection types that trigger a notification. Empty or absent means all.
+    # Known values: motion, person, vehicle, pet, other.
+    # Set e.g. [person, vehicle] to ignore plain motion alerts.
+    events: [motion, person, vehicle, pet, other]
 
 mqtt:
   enabled: false
