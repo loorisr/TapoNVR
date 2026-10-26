@@ -336,7 +336,7 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 			if det, derr := getDetection(app.db, extID); derr == nil && det != nil {
 				mqttPublishDetection(det)
 				broadcastDetection(camID, camName, dtype, bbox)
-				go pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, det.snapshotPath)
+				go pushNotifyDetection(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, det, detSnapSetByID(extID))
 				logIt(LINFO, "detection tag promoted", map[string]string{"camera": camName, "id": extID, "type": dtype})
 			}
 		}

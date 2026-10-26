@@ -108,6 +108,14 @@ alerts:
     snapshot_max_px: 1280
     # JPEG quality 1-100 of the attached copy (stored snapshot untouched).
     snapshot_quality: 70
+    # Attached frame: primary sends the trigger-frame snapshot immediately;
+    # best waits for the timed snapshot burst then attaches the frame with the
+    # largest matching SEI box (person/vehicle/pet/motion). Without boxes it
+    # falls back to the sharpest frame, then to the primary. Box scoring needs
+    # detection.source rtsp|both (ONVIF-only cameras have no boxes).
+    snapshot_pick: best
+    # Max seconds to wait for the burst in best mode (0..10, 0 = no wait).
+    best_max_wait_s: 5
     # Detection types that trigger a notification. Empty or absent means all.
     # Known values: motion, person, vehicle, pet, other.
     # Set e.g. [person, vehicle] to ignore plain motion alerts.

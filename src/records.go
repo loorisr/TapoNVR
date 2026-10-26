@@ -1490,9 +1490,9 @@ func decodeH264AUToJpeg(au [][]byte, camID, dest string) bool {
 // Zero network delay and temporally aligned to the pre-event window.
 // Returns false when buffer mode is off, buffer is empty, or decode fails
 // so the caller falls through to the live chain.
-func grabSnapshotFromBuffer(app *App, camID string, dest string) bool {
+func grabSnapshotFromBuffer(app *App, camID string, dest string) (bool, time.Duration) {
 	if app.cfg.Record.Mode != "buffer" {
-		return false
+		return false, 0
 	}
 	b := cameraBuffer(camID)
 	// Pin the ring so the watcher does not prune segments while we read.
@@ -1507,7 +1507,7 @@ func grabSnapshotFromBuffer(app *App, camID string, dest string) bool {
 		b.mu.Unlock()
 	}()
 	if len(segs) == 0 {
-		return false
+		return false, 0
 	}
 	// Newest first, try at most the last 3 complete segments.
 	start := 0
@@ -1515,12 +1515,12 @@ func grabSnapshotFromBuffer(app *App, camID string, dest string) bool {
 		start = len(segs) - 3
 	}
 	for i := len(segs) - 1; i >= start; i-- {
-		if decodeLatestIDRFromTs(segs[i].path, camID, dest) {
-			logIt(LDEBUG, "snapshot captured", map[string]string{"camera": camID, "snapshot": "buffer", "path": dest, "source": "buffer", "segment": segs[i].path})
-			return true
+		if ok, age := decodeLatestIDRFromTs(segs[i].path, camID, dest); ok {
+			logIt(LDEBUG, "snapshot captured", map[string]string{"camera": camID, "snapshot": "buffer", "path": dest, "source": "buffer", "segment": segs[i].path, "idr_age_ms": strconv.FormatInt(age.Milliseconds(), 10)})
+			return true, age
 		}
 	}
-	return false
+	return false, 0
 }
 
 // decodeLatestIDRFromTs demuxes one MPEG-TS segment, keeps the last random-access
@@ -1528,15 +1528,15 @@ func grabSnapshotFromBuffer(app *App, camID string, dest string) bool {
 // (still-recording) segments by decoding whatever IDRs are complete so far.
 // TODO: avoid the per-AU deep copy (keep NALU offsets into a shared arena and
 // decode once); the copy is bounded (one AU) so it stays as-is for now.
-func decodeLatestIDRFromTs(path, camID, dest string) bool {
+func decodeLatestIDRFromTs(path, camID, dest string) (bool, time.Duration) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, 0
 	}
 	defer f.Close()
 	r := &mpegts.Reader{R: f}
 	if err := r.Initialize(); err != nil {
-		return false
+		return false, 0
 	}
 	var h264Track *mpegts.Track
 	for _, t := range r.Tracks() {
@@ -1546,12 +1546,20 @@ func decodeLatestIDRFromTs(path, camID, dest string) bool {
 		}
 	}
 	if h264Track == nil {
-		return false
+		return false, 0
 	}
 	var sps, pps []byte
 	var lastAU [][]byte
 	var lastSPS, lastPPS []byte
+	// PTS is in 90kHz units. Track the last IDR and the newest AU so the
+	// caller can tell how stale the decoded frame is (the buffer keeps the
+	// last IDR of the segment, which can precede the event by one GOP).
+	var idrPTS int64 = -1
+	var maxPTS int64 = -1
 	r.OnDataH264(h264Track, func(pts int64, dts int64, au [][]byte) error {
+		if pts > maxPTS {
+			maxPTS = pts
+		}
 		for _, nalu := range au {
 			if len(nalu) == 0 {
 				continue
@@ -1566,6 +1574,7 @@ func decodeLatestIDRFromTs(path, camID, dest string) bool {
 		if !h264.IsRandomAccess(au) {
 			return nil
 		}
+		idrPTS = pts
 		cp := make([][]byte, 0, len(au))
 		for _, nalu := range au {
 			cp = append(cp, append([]byte(nil), nalu...))
@@ -1585,7 +1594,11 @@ func decodeLatestIDRFromTs(path, camID, dest string) bool {
 		}
 	}
 	if len(lastAU) == 0 {
-		return false
+		return false, 0
+	}
+	var age time.Duration
+	if idrPTS >= 0 && maxPTS > idrPTS {
+		age = time.Duration(maxPTS-idrPTS) * time.Second / 90000
 	}
 	hasSPS, hasPPS := false, false
 	for _, nalu := range lastAU {
@@ -1607,7 +1620,7 @@ func decodeLatestIDRFromTs(path, camID, dest string) bool {
 		complete = append(complete, lastPPS)
 	}
 	complete = append(complete, lastAU...)
-	return decodeH264AUToJpeg(complete, camID, dest)
+	return decodeH264AUToJpeg(complete, camID, dest), age
 }
 
 // grabSnapshotViaGortsplibHi264 is the pure-Go fallback when ffmpeg is not available.
@@ -1853,28 +1866,200 @@ func snapRecord(camID, source string, ok bool, errMsg string) {
 	}
 }
 
+// Snapshot freshness bounds. The rolling buffer keeps the last IDR of the
+// current segment, which can precede the event by one GOP: a stale image both
+// looks wrong in an alert and cannot be paired with the live SEI boxes.
+const (
+	snapshotMaxIDRAge        = 1500 * time.Millisecond
+	snapshotMaxBoxPairAge    = 1500 * time.Millisecond
+	snapshotBoxMaxAge        = 1500 * time.Millisecond
+	snapshotMaxStaleRetryAge = 10 * time.Second
+)
+
+// snapGrab describes one snapshot capture: where it came from, when the image
+// was actually taken, and how old the buffer IDR was (0 for live sources).
+type snapGrab struct {
+	source  string
+	ok      bool
+	imageAt time.Time
+	idrAge  time.Duration
+}
+
 // grabSnapshotChain tries every snapshot source in order (buffer IDR, native
 // ONVIF, pure-Go RTSP, http fallback) and records the outcome for status.
-// Returns the winning source name ("" when all failed).
+// A stale buffer frame is kept as a last resort but fresh sources are tried
+// first, so alerts and SEI box pairing get a frame that matches the event.
+// Returns the winning source name ("" when all failed) and whether it worked.
 func grabSnapshotChain(app *App, camID, dest string) (string, bool) {
-	if grabSnapshotFromBuffer(app, camID, dest) {
-		snapRecord(camID, "buffer", true, "")
-		return "buffer", true
+	var g = grabSnapshotChainMeta(app, camID, dest)
+	return g.source, g.ok
+}
+
+func grabSnapshotChainMeta(app *App, camID, dest string) snapGrab {
+	var stale snapGrab
+	if ok, age := grabSnapshotFromBuffer(app, camID, dest); ok {
+		var g = snapGrab{source: "buffer", ok: true, imageAt: time.Now().Add(-age), idrAge: age}
+		if age <= snapshotMaxIDRAge {
+			snapRecord(camID, "buffer", true, "")
+			return g
+		}
+		if age > snapshotMaxStaleRetryAge {
+			// The buffer itself stopped advancing (camera offline): retrying a
+			// live source would just add several timeouts. Keep the frame.
+			snapRecord(camID, "buffer", true, "very stale IDR")
+			logIt(LWARN, "snapshot buffer very stale, using it", map[string]string{
+				"camera": camID, "idr_age_ms": strconv.FormatInt(age.Milliseconds(), 10),
+			})
+			return g
+		}
+		stale = g
+		logIt(LDEBUG, "snapshot buffer stale, trying fresh source", map[string]string{
+			"camera": camID, "idr_age_ms": strconv.FormatInt(age.Milliseconds(), 10),
+		})
 	}
 	if grabSnapshotNative(app, camID, dest) {
 		snapRecord(camID, "native", true, "")
-		return "native", true
+		return snapGrab{source: "native", ok: true, imageAt: time.Now()}
 	}
 	if grabSnapshotFast(app, camID, dest) {
 		snapRecord(camID, "rtsp/gortsplib", true, "")
-		return "rtsp/gortsplib", true
+		return snapGrab{source: "rtsp/gortsplib", ok: true, imageAt: time.Now()}
 	}
 	if grabSnapshotHttp(app, camID, dest) {
 		snapRecord(camID, "http-fallback", true, "")
-		return "http-fallback", true
+		return snapGrab{source: "http-fallback", ok: true, imageAt: time.Now()}
+	}
+	if stale.ok {
+		// Fresh sources failed: a slightly old frame still beats no image.
+		snapRecord(camID, "buffer", true, "stale IDR fallback")
+		logIt(LDEBUG, "snapshot stale buffer fallback", map[string]string{
+			"camera": camID, "idr_age_ms": strconv.FormatInt(stale.idrAge.Milliseconds(), 10),
+		})
+		return stale
 	}
 	snapRecord(camID, "failed", false, "all snapshot sources failed")
-	return "", false
+	return snapGrab{}
+}
+
+// ---------------- alerts: best snapshot set --------------------
+
+// snapCandidate is one still that may be attached to a Pushover message.
+// boxes are the SEI boxes seen at capture time (empty when none/unknown) and
+// at is when the image itself was taken (for pairing/tie-breaks).
+type snapCandidate struct {
+	path        string
+	boxes       []detBox
+	at          time.Time
+	placeholder bool
+}
+
+// detSnapSet collects the candidates for one detection while the timed burst
+// runs. The notification goroutine waits for done (bounded) and then picks the
+// best frame; late extras are simply absent from the snapshot.
+type detSnapSet struct {
+	mu    sync.Mutex
+	cands []snapCandidate
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newDetSnapSet() *detSnapSet {
+	return &detSnapSet{done: make(chan struct{})}
+}
+
+func (s *detSnapSet) add(c snapCandidate) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cands = append(s.cands, c)
+	s.mu.Unlock()
+}
+
+func (s *detSnapSet) finish() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { close(s.done) })
+}
+
+// wait blocks until the burst completes or max elapses. max <= 0 returns
+// immediately (send whatever is already captured).
+func (s *detSnapSet) wait(max time.Duration) {
+	if s == nil || max <= 0 {
+		return
+	}
+	select {
+	case <-s.done:
+	case <-time.After(max):
+	}
+}
+
+func (s *detSnapSet) snapshot() []snapCandidate {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]snapCandidate(nil), s.cands...)
+}
+
+// detSnapSets maps a detection id to its in-flight candidate set so a late
+// tag-promotion notification can reuse the same boxes. Entries expire after a
+// few minutes (covers continuous bursts, capped at 180s); the push path holds
+// its own pointer, so expiration only affects later lookups.
+const detSnapSetTTL = 4 * time.Minute
+
+var detSnapSetsMtx sync.Mutex
+var detSnapSets = map[string]*detSnapSet{}
+
+func registerDetSnapSet(id string) *detSnapSet {
+	var s = newDetSnapSet()
+	detSnapSetsMtx.Lock()
+	detSnapSets[id] = s
+	detSnapSetsMtx.Unlock()
+	time.AfterFunc(detSnapSetTTL, func() { dropDetSnapSet(id, s) })
+	return s
+}
+
+func detSnapSetByID(id string) *detSnapSet {
+	detSnapSetsMtx.Lock()
+	defer detSnapSetsMtx.Unlock()
+	return detSnapSets[id]
+}
+
+func dropDetSnapSet(id string, s *detSnapSet) {
+	detSnapSetsMtx.Lock()
+	if detSnapSets[id] == s {
+		delete(detSnapSets, id)
+	}
+	detSnapSetsMtx.Unlock()
+}
+
+// detectionSnapshotCandidates returns the stored candidates of a detection
+// (primary + extras) without boxes. Used when the in-memory set is gone (tag
+// promotion after expiry/restart): scoring then falls back to sharpness.
+func detectionSnapshotCandidates(d *Detection) []snapCandidate {
+	if d == nil {
+		return nil
+	}
+	var out []snapCandidate
+	if d.snapshotPath != "" {
+		out = append(out, snapCandidate{path: d.snapshotPath})
+	}
+	for _, p := range strings.Split(d.extraSnap, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, snapCandidate{path: p})
+		}
+	}
+	return out
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // snapStatusJSON renders a camera's snapshot provenance for the status payload.
@@ -1933,6 +2118,11 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	if continuous {
 		extraCount = -1 // sentinel understood by captureSnapshotBurst
 	}
+	// Best-frame selection needs the timed burst to finish before the alert is
+	// sent. The set is registered before the burst goroutine so the notifier
+	// can wait on it; in "primary" mode it stays nil (legacy behavior).
+	var bestMode = snapOn && pushoverEnabled() && app.cfg.Alerts.Pushover.SendSnapshot && pushoverPickBest(app.cfg.Alerts.Pushover)
+	var snapSet *detSnapSet
 
 	if src == "" {
 		// Test placeholder media (no-op rows for manual testing). The text
@@ -1943,11 +2133,14 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 		var txtClip = strings.TrimSuffix(clip, ".mp4") + ".txt"
 		_ = os.WriteFile(txtClip, probe, 0o640)
 	} else {
+		var primaryCandidate snapCandidate
+		var primaryValid bool
 		if snapOn {
 			// Capture the primary snapshot: rolling-buffer IDR first (zero delay,
 			// pre-event aligned), then native ONVIF, pure-Go RTSP, http fallback,
 			// then placeholder. No ffmpeg/go2rtc.
-			var source, ok = grabSnapshotChain(app, camID, snap)
+			var grab = grabSnapshotChainMeta(app, camID, snap)
+			var source, ok = grab.source, grab.ok
 			if !ok {
 				source = "failed"
 			}
@@ -1970,16 +2163,48 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 				logIt(LDEBUG, "snapshot captured", map[string]string{
 					"camera": camID, "snapshot": "primary", "path": snap, "source": source,
 				})
+				// The trigger-frame boxes only describe this image when the
+				// buffer IDR is fresh; otherwise they belong to a newer moment.
+				primaryCandidate = snapCandidate{
+					path:        snap,
+					at:          grab.imageAt,
+					placeholder: source == "placeholder",
+				}
+				if primaryCandidate.at.IsZero() {
+					primaryCandidate.at = time.Now()
+				}
+				if source != "placeholder" && grab.idrAge <= snapshotMaxBoxPairAge {
+					primaryCandidate.boxes = parseBoxesJSON(bbox)
+					// ONVIF-triggered events carry no boxes even when the RTSP
+					// reader is also active (source "both"): borrow the live
+					// ones when they line up with the captured frame.
+					if len(primaryCandidate.boxes) == 0 {
+						if b, at, ok := latestSEIBoxes(camID, snapshotBoxMaxAge); ok && absDuration(primaryCandidate.at.Sub(at)) <= snapshotMaxBoxPairAge {
+							primaryCandidate.boxes = b
+						}
+					}
+				}
+				primaryValid = true
 			} else {
 				logIt(LWARN, "snapshot failed", map[string]string{"camera": camID, "snapshot": "primary"})
 				_ = os.Remove(snap)
+			}
+			if bestMode {
+				snapSet = registerDetSnapSet(id)
+				if primaryValid {
+					snapSet.add(primaryCandidate)
+				}
+				if !(extraCount > 0 || continuous) {
+					snapSet.finish()
+				}
 			}
 			// The remaining snapshots are captured in the background, spaced at
 			// least `interval` seconds apart. Kept async so it does not delay
 			// the primary snapshot / detection.
 			if extraCount > 0 || continuous {
 				go func() {
-					var extra = captureSnapshotBurst(app, base, id, camID, extraCount, interval, now)
+					defer snapSet.finish() // nil-safe; wakes the notifier on every path
+					var extra = captureSnapshotBurstMeta(app, base, id, camID, extraCount, interval, now, snapSet.add)
 					if len(extra) == 0 {
 						return
 					}
@@ -2077,46 +2302,47 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	if derr != nil {
 		return nil, derr
 	}
-	// S3 upload + Pushover run in the background: both can block for seconds
-	// (S3 up to minutes on a hung endpoint, Pushover 15s timeout) and must not
-	// stall the ONVIF webhook response or the grouping path. Values are copied
-	// for the goroutine; the DB row above is already committed.
-	go func(app *App, snap, clipPath, camName, dtype, id, mode string, snapOn, recordOn bool, hasSrc bool) {
-		if s3UploadEnabled() && hasSrc {
-			// Upload each artifact independently: a failed/absent snapshot must
-			// not suppress the clip upload (event mode has no later retry pass
-			// unless the user triggers one) and snapshots can be disabled while
-			// recording still produces a clip.
-			var allOK = true
-			if snapOn {
-				if snap == "" {
-					allOK = false
-				} else if e2 := s3PutFile(app, s3KeyForPath(snap), snap, "image/jpeg"); e2 != nil {
-					logIt(LWARN, "s3 snapshot upload failed", map[string]string{"id": id, "error": e2.Error()})
-					allOK = false
-				}
-			}
-			var clipPending = recordOn && mode == "buffer"
-			if recordOn && mode != "buffer" {
-				if clipPath == "" {
-					allOK = false // expected clip absent
-				} else if e2 := s3PutFile(app, s3KeyForPath(clipPath), clipPath, clipContentType(clipPath)); e2 != nil {
-					logIt(LWARN, "s3 clip upload failed", map[string]string{"id": id, "error": e2.Error()})
-					allOK = false
-				}
-			}
-			// In buffer mode assembleClip uploads the clip and marks the row;
-			// elsewhere mark it once every expected artifact is up.
-			if allOK && !clipPending {
-				_ = dbSetUploaded(app.db, id)
-			}
+	// S3 upload runs in the background: it can block for minutes on a hung
+	// endpoint and must not stall the ONVIF webhook response or the grouping
+	// path. Pushover is a separate goroutine so a slow upload never delays the
+	// alert (and vice versa).
+	go func(app *App, snap, clipPath, id, mode string, snapOn, recordOn bool, hasSrc bool) {
+		if !s3UploadEnabled() || !hasSrc {
+			return
 		}
+		// Upload each artifact independently: a failed/absent snapshot must
+		// not suppress the clip upload (event mode has no later retry pass
+		// unless the user triggers one) and snapshots can be disabled while
+		// recording still produces a clip.
+		var allOK = true
 		if snapOn {
-			pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, snap)
-		} else {
-			pushNotify(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, "")
+			if snap == "" {
+				allOK = false
+			} else if e2 := s3PutFile(app, s3KeyForPath(snap), snap, "image/jpeg"); e2 != nil {
+				logIt(LWARN, "s3 snapshot upload failed", map[string]string{"id": id, "error": e2.Error()})
+				allOK = false
+			}
 		}
-	}(app, snap, clipPath, camName, d.detType, id, app.cfg.Record.Mode, snapOn, recordOn, src != "")
+		var clipPending = recordOn && mode == "buffer"
+		if recordOn && mode != "buffer" {
+			if clipPath == "" {
+				allOK = false // expected clip absent
+			} else if e2 := s3PutFile(app, s3KeyForPath(clipPath), clipPath, clipContentType(clipPath)); e2 != nil {
+				logIt(LWARN, "s3 clip upload failed", map[string]string{"id": id, "error": e2.Error()})
+				allOK = false
+			}
+		}
+		// In buffer mode assembleClip uploads the clip and marks the row;
+		// elsewhere mark it once every expected artifact is up.
+		if allOK && !clipPending {
+			_ = dbSetUploaded(app.db, id)
+		}
+	}(app, snap, clipPath, id, app.cfg.Record.Mode, snapOn, recordOn, src != "")
+	{
+		var title = "Detection: " + camName
+		var message = d.detType + " detected on " + camName
+		go pushNotifyDetection(app, d.detType, title, message, &d, snapSet)
+	}
 	// Notify connected WebUI clients immediately ("motion detected").
 	broadcastDetection(camID, camName, d.detType, bbox)
 	mqttPublishDetection(&d)
@@ -2150,6 +2376,14 @@ const maxContinuousSecs = 180
 // above). Each grab uses buffer IDR first, then native ONVIF, RTSP
 // gortsplib+hi264, http fallback. No ffmpeg.
 func captureSnapshotBurst(app *App, base string, detID string, camID string, count int, interval int, eventT int64) []string {
+	return captureSnapshotBurstMeta(app, base, detID, camID, count, interval, eventT, nil)
+}
+
+// captureSnapshotBurstMeta is captureSnapshotBurst with an optional callback
+// invoked for every successful shot. The callback receives the SEI boxes seen
+// around the capture so the alert path can select the frame where the subject
+// is largest. onSnap may be nil.
+func captureSnapshotBurstMeta(app *App, base string, detID string, camID string, count int, interval int, eventT int64, onSnap func(snapCandidate)) []string {
 	var paths []string
 	// Clamp the schedule inputs: count<=16, interval<=30s and total burst
 	// duration<=10min, so a misconfigured interval_s/count can neither pin
@@ -2230,13 +2464,27 @@ func captureSnapshotBurst(app *App, base string, detID string, camID string, cou
 			return paths
 		}
 		var p = base + "/" + friendlyTS(target.Unix()) + "-" + detID + "-snap" + strconv.Itoa(i) + ".jpg"
-		var source, ok = grabSnapshotChain(app, camID, p)
+		var g = grabSnapshotChainMeta(app, camID, p)
+		var source, ok = g.source, g.ok
 		if !ok {
 			source = "failed"
 		}
 		lastFire = time.Now() // spacing applies from shot completion, success or not
 		if s, e := os.Stat(p); e == nil && s.Mode().IsRegular() && s.Size() > 0 && ok {
 			paths = append(paths, p)
+			if onSnap != nil {
+				var boxes []detBox
+				var boxAt time.Time
+				if g.idrAge <= snapshotMaxBoxPairAge {
+					if b, at, ok := latestSEIBoxes(camID, snapshotBoxMaxAge); ok {
+						boxes, boxAt = b, at
+					}
+					if !boxAt.IsZero() && absDuration(g.imageAt.Sub(boxAt)) > snapshotMaxBoxPairAge {
+						boxes = nil // image and boxes are too far apart to trust
+					}
+				}
+				onSnap(snapCandidate{path: p, boxes: boxes, at: g.imageAt})
+			}
 			logIt(LDEBUG, "snapshot captured", map[string]string{
 				"camera": camID, "snapshot": strconv.Itoa(i), "path": p, "source": source,
 			})

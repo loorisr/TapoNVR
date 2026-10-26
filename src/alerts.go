@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -149,27 +150,34 @@ func pushoverEventAllowed(p PushoverCfg, eventType string) bool {
 	return false
 }
 
-// pushNotify sends a Pushover notification for a detection event of type
-// eventType. When send_snapshot is on and snapPath is a non-empty path to a
-// readable JPEG, a compressed copy of the image is attached to the message via
-// multipart/form-data. Events not listed in alerts.pushover.events are silently
-// skipped.
-// Sends are throttled to one per Pushover.MinIntervalS seconds (0 disables
-// throttling). Errors are logged and swallowed. The throttle slot is reserved
-// before the send (so concurrent bursts still collapse to one) but rolled back
-// when the send fails, so a failure doesn't silence the next window.
-func pushNotify(app *App, eventType string, title string, message string, snapPath string) {
+// pushoverPickBest reports whether the attached frame should be chosen after
+// the timed snapshot burst (largest matching SEI box, sharpness fallback)
+// instead of sending the trigger-frame snapshot immediately.
+func pushoverPickBest(p PushoverCfg) bool {
+	return strings.EqualFold(strings.TrimSpace(p.SnapshotPick), "best")
+}
+
+// pushTicket is a prepared Pushover send: config snapshot + reserved throttle
+// slot. prepare returns ok=false when the alert is disabled, filtered or not
+// configured, so callers never wait for a snapshot that will not be sent.
+type pushTicket struct {
+	cfg      PushoverCfg
+	reserved int64
+	ok       bool
+}
+
+func pushPrepare(app *App, eventType string, title string) pushTicket {
 	var p = app.cfg.Alerts.Pushover
 	if !pushoverEnabled() {
-		return
+		return pushTicket{}
 	}
 	if !pushoverEventAllowed(p, eventType) {
 		logIt(LDEBUG, "pushover event filtered", map[string]string{"type": eventType, "title": title})
-		return
+		return pushTicket{}
 	}
 	if strings.TrimSpace(p.AppToken) == "" || strings.TrimSpace(p.UserKey) == "" {
 		logIt(LWARN, "pushover not configured (app_token or user_key empty)", map[string]string{"title": title})
-		return
+		return pushTicket{}
 	}
 	var reserved int64
 	if p.MinIntervalS > 0 {
@@ -179,24 +187,329 @@ func pushNotify(app *App, eventType string, title string, message string, snapPa
 		if lastPushUnix != 0 && elapsed < int64(p.MinIntervalS) {
 			pushRateMtx.Unlock()
 			logIt(LDEBUG, "pushover throttled", map[string]string{"title": title, "elapsed": fmt.Sprintf("%d", elapsed)})
-			return
+			return pushTicket{}
 		}
 		reserved = now
 		lastPushUnix = now
 		pushRateMtx.Unlock()
 	}
-	// rollback releases a reserved throttle slot when the send did not succeed.
-	var rollback = func() {
-		if reserved == 0 {
+	return pushTicket{cfg: p, reserved: reserved, ok: true}
+}
+
+// rollback releases a reserved throttle slot when the send did not succeed.
+func (t pushTicket) rollback() {
+	if t.reserved == 0 {
+		return
+	}
+	pushRateMtx.Lock()
+	if lastPushUnix == t.reserved {
+		lastPushUnix = 0
+	}
+	pushRateMtx.Unlock()
+}
+
+// pushNotify sends a Pushover notification for a detection event of type
+// eventType, attaching snapPath when send_snapshot is on. Events not listed in
+// alerts.pushover.events are silently skipped.
+func pushNotify(app *App, eventType string, title string, message string, snapPath string) {
+	var cands []snapCandidate
+	if snapPath != "" {
+		cands = append(cands, snapCandidate{path: snapPath})
+	}
+	pushNotifyCandidates(app, eventType, title, message, cands)
+}
+
+func pushNotifyCandidates(app *App, eventType string, title string, message string, cands []snapCandidate) {
+	var t = pushPrepare(app, eventType, title)
+	if !t.ok {
+		return
+	}
+	pushSend(app, t, title, message, []string{eventType}, cands)
+}
+
+// pushNotifyBest waits (bounded by maxWait) for the snapshot burst to finish,
+// then attaches the best frame among the candidates. When the burst/lookup is
+// unavailable it falls back to fallback (the primary snapshot) and finally to
+// a text-only alert.
+func pushNotifyBest(app *App, eventType string, title string, message string, detID string, set *detSnapSet, fallback string, maxWait time.Duration) {
+	var t = pushPrepare(app, eventType, title)
+	if !t.ok {
+		return
+	}
+	var cands []snapCandidate
+	if pushoverPickBest(t.cfg) && t.cfg.SendSnapshot && set != nil {
+		set.wait(maxWait)
+		cands = set.snapshot()
+	}
+	if len(cands) == 0 && fallback != "" {
+		cands = append(cands, snapCandidate{path: fallback})
+	}
+	var tags = []string{eventType}
+	if detID != "" {
+		if d, err := getDetection(app.db, detID); err == nil && d != nil {
+			if tl := detectionTagList(d); len(tl) > 0 {
+				tags = tl
+			}
+		}
+	}
+	pushSend(app, t, title, message, tags, cands)
+}
+
+// pushNotifyDetection is the detection-aware entry point used by the initial
+// alert and by tag-promotion alerts. In "best" mode it reuses the in-flight
+// candidate set (boxes included) or, when the set is gone, all stored snapshots
+// (sharpness fallback). In "primary" mode it keeps the legacy single-snapshot
+// behavior.
+func pushNotifyDetection(app *App, eventType string, title string, message string, det *Detection, set *detSnapSet) {
+	if det == nil {
+		return
+	}
+	if !app.cfg.Alerts.Pushover.SendSnapshot {
+		// No frame to pick: do not make the alert wait for the burst.
+		pushNotify(app, eventType, title, message, "")
+		return
+	}
+	if pushoverPickBest(app.cfg.Alerts.Pushover) {
+		if set == nil {
+			set = detSnapSetByID(det.id)
+		}
+		if set != nil {
+			pushNotifyBest(app, eventType, title, message, det.id, set, det.snapshotPath, time.Duration(app.cfg.Alerts.Pushover.BestMaxWaitS)*time.Second)
 			return
 		}
-		pushRateMtx.Lock()
-		if lastPushUnix == reserved {
-			lastPushUnix = 0
-		}
-		pushRateMtx.Unlock()
+		pushNotifyCandidates(app, eventType, title, message, detectionSnapshotCandidates(det))
+		return
 	}
-	var snap = pushAttachment(p, snapPath)
+	pushNotify(app, eventType, title, message, det.snapshotPath)
+}
+
+// detectionTagList returns the detection's merged tags (primary first), used
+// to choose which SEI box types matter for the attached frame.
+func detectionTagList(d *Detection) []string {
+	if d == nil {
+		return nil
+	}
+	var out []string
+	for _, t := range strings.Split(d.detTypes, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 && d.detType != "" {
+		out = append(out, d.detType)
+	}
+	return out
+}
+
+// Box-area bounds for frame selection: tiny boxes are noise, huge ones are a
+// subject glued to the lens (or a foreground false positive).
+const (
+	pushMinBoxArea = 0.005
+	pushMaxBoxArea = 0.85
+	pushBoxAreaTie = 0.02
+)
+
+// pickBestSnapshot chooses the still that best shows the event: the largest
+// matching SEI box wins; near-ties prefer a specific type (person/vehicle/pet)
+// then the sharpest frame, then the most recent one. Without boxes it falls
+// back to sharpness (exposure-penalized). Missing/unreadable files are ignored.
+func pickBestSnapshot(cands []snapCandidate, tags []string) snapCandidate {
+	var best snapCandidate
+	var bestOK bool
+	var bestArea float64
+	var bestRank int
+	var bestSharp float64
+	var haveReal bool
+	for _, c := range cands {
+		if c.path != "" && !c.placeholder {
+			haveReal = true
+			break
+		}
+	}
+	for _, c := range cands {
+		if strings.TrimSpace(c.path) == "" {
+			continue
+		}
+		if c.placeholder && haveReal {
+			continue // never pick a "NO SIGNAL" placeholder over a real frame
+		}
+		if s, err := os.Stat(c.path); err != nil || s.Size() == 0 || s.Size() > 20<<20 {
+			continue
+		}
+		raw, err := os.ReadFile(c.path)
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		var area, rank = bestSEIBoxArea(c.boxes, tags)
+		var sharp = imageSharpness(raw)
+		if !bestOK {
+			best, bestOK, bestArea, bestRank, bestSharp = c, true, area, rank, sharp
+			continue
+		}
+		var better bool
+		switch {
+		case bestArea == 0 && area > 0:
+			better = true // a real box beats a frame with no detectable subject
+		case bestArea > 0 && area == 0:
+			better = false
+		case area > bestArea+pushBoxAreaTie:
+			better = true
+		case area < bestArea-pushBoxAreaTie:
+			better = false
+		case rank != bestRank:
+			better = rank > bestRank
+		case sharp > bestSharp*1.02:
+			better = true
+		case sharp >= bestSharp*0.98 && c.at.After(best.at):
+			better = true
+		}
+		if better {
+			best, bestArea, bestRank, bestSharp = c, area, rank, sharp
+		}
+	}
+	if !bestOK {
+		return snapCandidate{}
+	}
+	return best
+}
+
+// bestSEIBoxArea returns the largest matching box area (normalized 0..1) and
+// whether that box is a specific type (1) or a generic motion marker (0).
+func bestSEIBoxArea(boxes []detBox, tags []string) (float64, int) {
+	var best float64
+	var rank int
+	for _, b := range boxes {
+		if len(tags) > 0 && !stringInFold(tags, b.Type) {
+			continue
+		}
+		var x1, y1, x2, y2 = clamp01f(b.X1), clamp01f(b.Y1), clamp01f(b.X2), clamp01f(b.Y2)
+		var w, h = x2 - x1, y2 - y1
+		if w <= 0 || h <= 0 {
+			continue
+		}
+		var area = w * h
+		if area < pushMinBoxArea || area > pushMaxBoxArea {
+			continue
+		}
+		var r int
+		switch strings.ToLower(strings.TrimSpace(b.Type)) {
+		case "person", "vehicle", "pet", "other":
+			r = 1
+		}
+		if area > best || (area == best && r > rank) {
+			best, rank = area, r
+		}
+	}
+	return best, rank
+}
+
+func stringInFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(s)) {
+			return true
+		}
+	}
+	return false
+}
+
+func clamp01f(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// imageSharpness returns a sharpness score (variance of the Laplacian) on a
+// downscaled grayscale copy. A dark or blown-out frame is halved so a flat
+// black frame cannot win a tie against a usable one.
+func imageSharpness(raw []byte) float64 {
+	img, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return 0
+	}
+	var b = img.Bounds()
+	var w, h = b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return 0
+	}
+	const maxSide = 320
+	var nw, nh = w, h
+	if w >= h && w > maxSide {
+		nw = maxSide
+		nh = h * maxSide / w
+	} else if h > maxSide {
+		nh = maxSide
+		nw = w * maxSide / h
+	}
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	if nw != w || nh != h {
+		img = boxDownscale(img, b, nw, nh)
+		b = img.Bounds()
+		w, h = b.Dx(), b.Dy()
+	}
+	if w < 3 || h < 3 {
+		return 0
+	}
+	var gray = make([]float64, w*h)
+	var sum float64
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			var r, g, bl, _ = img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			var l = 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(bl>>8)
+			gray[y*w+x] = l
+			sum += l
+		}
+	}
+	var mean = sum / float64(w*h)
+	var lapSum, lapSq float64
+	var n int
+	for y := 1; y < h-1; y++ {
+		for x := 1; x < w-1; x++ {
+			var i = y*w + x
+			var lap = 4*gray[i] - gray[i-w] - gray[i+w] - gray[i-1] - gray[i+1]
+			lapSum += lap
+			lapSq += lap * lap
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	var lapMean = lapSum / float64(n)
+	var variance = lapSq/float64(n) - lapMean*lapMean
+	if variance < 0 {
+		variance = 0
+	}
+	if mean < 25 || mean > 230 {
+		variance *= 0.5
+	}
+	return variance
+}
+
+// pushSend attaches the chosen frame and performs the HTTP request. Errors are
+// logged and swallowed; the throttle slot is rolled back on failure.
+func pushSend(app *App, t pushTicket, title string, message string, tags []string, cands []snapCandidate) {
+	var p = t.cfg
+	var pick snapCandidate
+	var snap []byte
+	if p.SendSnapshot && len(cands) > 0 {
+		if len(cands) == 1 {
+			pick = cands[0] // nothing to choose: skip the extra decode
+		} else {
+			pick = pickBestSnapshot(cands, tags)
+		}
+		if pick.path != "" {
+			snap = pushAttachment(p, pick.path)
+		}
+	}
 	var snapOK = len(snap) > 0
 	var ctype string
 	var body io.Reader
@@ -234,15 +547,24 @@ func pushNotify(app *App, eventType string, title string, message string, snapPa
 	resp, err := client.Post("https://api.pushover.net/1/messages.json", ctype, body)
 	if err != nil {
 		logIt(LWARN, "pushover send failed", map[string]string{"error": err.Error()})
-		rollback()
+		t.rollback()
 		return
 	}
 	var respBody, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		logIt(LWARN, "pushover send rejected", map[string]string{"status": resp.Status, "body": truncateForLog(string(respBody), 512)})
-		rollback()
+		t.rollback()
 		return
 	}
-	logIt(LINFO, "pushover message sent", map[string]string{"title": title, "message": message, "with_snapshot": map[bool]string{true: "true", false: "false"}[snapOK], "attach_bytes": fmt.Sprintf("%d", len(snap))})
+	var fields = map[string]string{
+		"title":         title,
+		"message":       message,
+		"with_snapshot": map[bool]string{true: "true", false: "false"}[snapOK],
+		"attach_bytes":  fmt.Sprintf("%d", len(snap)),
+	}
+	if snapOK && pick.path != "" {
+		fields["picked"] = filepath.Base(pick.path)
+	}
+	logIt(LINFO, "pushover message sent", fields)
 }

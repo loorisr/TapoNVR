@@ -235,6 +235,14 @@ type PushoverCfg struct {
 	SnapshotMaxPx int `yaml:"snapshot_max_px"`
 	// SnapshotQuality is the JPEG quality (1-100) of the attached copy.
 	SnapshotQuality int `yaml:"snapshot_quality"`
+	// SnapshotPick selects the attached frame: "primary" (default) sends the
+	// trigger-frame snapshot immediately; "best" waits for the timed burst and
+	// attaches the frame with the largest matching SEI box, falling back to the
+	// sharpest frame and then the primary. The stored files are never modified.
+	SnapshotPick string `yaml:"snapshot_pick"`
+	// BestMaxWaitS bounds the wait for the snapshot burst in "best" mode
+	// (seconds, 0..10). 0 means "do not wait" (send what is already captured).
+	BestMaxWaitS int `yaml:"best_max_wait_s"`
 	// Events lists the detection types that trigger a notification (motion,
 	// person, vehicle, pet, other). Empty or absent means every type, so
 	// existing configs keep notifying on all detections.
@@ -503,6 +511,8 @@ func configDefaults(c *Config) {
 	c.Alerts.Pushover.SendSnapshot = true
 	c.Alerts.Pushover.SnapshotMaxPx = 1280
 	c.Alerts.Pushover.SnapshotQuality = 70
+	c.Alerts.Pushover.SnapshotPick = "primary"
+	c.Alerts.Pushover.BestMaxWaitS = 5
 	c.Alerts.Pushover.Events = slices.Clone(allDetectionTypes)
 	c.Mqtt.Enabled = false
 	c.Mqtt.Broker = ""
@@ -705,6 +715,21 @@ func loadConfig(path string) (*Config, error) {
 	if c.Alerts.Pushover.SnapshotMaxPx < 0 {
 		configWarn("config clamped: alerts.pushover.snapshot_max_px < 0, using 0", nil)
 		c.Alerts.Pushover.SnapshotMaxPx = 0
+	}
+	// Attached-frame selection: "primary" (legacy) or "best" (largest SEI box
+	// after the burst). Unknown values fall back to the legacy behavior.
+	switch strings.ToLower(strings.TrimSpace(c.Alerts.Pushover.SnapshotPick)) {
+	case "", "primary":
+		c.Alerts.Pushover.SnapshotPick = "primary"
+	case "best":
+		c.Alerts.Pushover.SnapshotPick = "best"
+	default:
+		configWarn("config clamped: alerts.pushover.snapshot_pick must be primary|best, using primary", map[string]string{"value": c.Alerts.Pushover.SnapshotPick})
+		c.Alerts.Pushover.SnapshotPick = "primary"
+	}
+	if c.Alerts.Pushover.BestMaxWaitS < 0 || c.Alerts.Pushover.BestMaxWaitS > 10 {
+		configWarn("config clamped: alerts.pushover.best_max_wait_s not in 0..10, using 5", map[string]string{"value": strconv.Itoa(c.Alerts.Pushover.BestMaxWaitS)})
+		c.Alerts.Pushover.BestMaxWaitS = 5
 	}
 	// Pushover event filter: normalize labels, drop unknowns and duplicates.
 	// An empty list (or the key absent) means every detection type.

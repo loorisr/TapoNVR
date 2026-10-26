@@ -75,7 +75,7 @@ YAML file.
 
 **Integrations and operations**
 - Local storage plus S3-compatible upload (MinIO, Cloudflare R2, …).
-- MQTT events, Pushover notifications and ONVIF PTZ control.
+- MQTT events, Pushover notifications (optional best-frame attachment using the largest matching SEI box) and ONVIF PTZ control.
 - Single binary, distroless Docker image, no ffmpeg and no shell.
 - HTTP Basic Auth and reverse-proxy-friendly deployment.
 
@@ -158,7 +158,25 @@ See `config.example.yaml` for the full file. Key settings:
 | `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent) |
 | `detection.source` | `onvif` (webhook, type only — default), `rtsp` (camera AI boxes + type from H.264 SEI), or `both` |
 | `detection.rtsp.*` | SEI reader tuning: `transport`, `debounce_s`, `hold_s`, `types`, `use_go2rtc` |
-| `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; oversized copies fall back to text-only) |
+| `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; `snapshot_pick: best` waits for the burst and attaches the frame with the largest matching SEI box — sharpness fallback; oversized copies fall back to text-only) |
+
+### Pushover: best attached frame
+
+`alerts.pushover.snapshot_pick: best` delays the alert until the timed snapshot
+burst ends (bounded by `best_max_wait_s`, default 5 s) and attaches the frame
+with the largest SEI box matching the detection tags. Near-ties prefer a
+specific type (`person`/`vehicle`/`pet`) over a generic `motion` box, then the
+sharpest frame, then the most recent one. Boxes are ignored when the buffer
+image is older than ~1.5 s (so a stale IDR is never paired with newer boxes).
+
+Without usable boxes (ONVIF-only source, or no box in any candidate) the
+sharpest non-placeholder frame wins, then the primary. `primary` (the code
+default for existing configs) keeps the immediate trigger-frame behavior.
+
+The capture chain also retries a fresh native/RTSP grab when the rolling-buffer
+IDR is stale (>1.5 s) and keeps the old frame only as a last resort. Only the
+attached copy is affected: stored snapshots, S3 uploads and the primary shown in
+the UI are unchanged.
 
 ### Camera
 

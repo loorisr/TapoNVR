@@ -337,6 +337,9 @@ func stopDetectionRTSP() {
 	}
 	detectionRTSPStopped = true
 	close(detectionRTSPStop)
+	rtspDetMtx.Lock()
+	rtspDetectors = map[string]*rtspDetector{}
+	rtspDetMtx.Unlock()
 }
 
 func detectionRTSPStoppedCh() <-chan struct{} {
@@ -362,6 +365,12 @@ type rtspDetector struct {
 	mu       sync.Mutex
 	active   map[string]time.Time
 	lastEmit map[string]time.Time
+	// lastBoxes/lastBoxesAt keep the most recent frame's boxes so a snapshot
+	// captured by another goroutine can be paired with the SEI state at that
+	// moment (Pushover "best frame" selection). All reported boxes are kept;
+	// callers filter by detection type.
+	lastBoxes   []detBox
+	lastBoxesAt time.Time
 	// liveAt throttles the SSE "boxes" events feeding the live overlay:
 	// SEI markers can arrive on every frame, but ~5 updates/s is plenty to
 	// draw boxes without flooding the browser.
@@ -371,6 +380,49 @@ type rtspDetector struct {
 // liveBoxInterval is the minimum delay between two live-overlay box broadcasts
 // for one camera (5 updates/s).
 const liveBoxInterval = 200 * time.Millisecond
+
+// rtspDetMtx guards rtspDetectors: the running detector per camera, so the
+// snapshot pipeline can read the current SEI boxes.
+var rtspDetMtx sync.Mutex
+var rtspDetectors = map[string]*rtspDetector{}
+
+func registerRTSPDetector(d *rtspDetector) {
+	if d == nil || d.camID == "" {
+		return
+	}
+	rtspDetMtx.Lock()
+	rtspDetectors[d.camID] = d
+	rtspDetMtx.Unlock()
+}
+
+func unregisterRTSPDetector(camID string) {
+	rtspDetMtx.Lock()
+	delete(rtspDetectors, camID)
+	rtspDetMtx.Unlock()
+}
+
+// latestSEIBoxes returns a copy of the last boxes seen for a camera and when
+// they were seen. ok is false when no detector is running, no box was ever
+// seen, or the newest box is older than maxAge (0 disables the age check).
+// The caller pairs them with a snapshot: when the two are more than ~1s apart
+// the boxes are considered unrelated to that image.
+func latestSEIBoxes(camID string, maxAge time.Duration) ([]detBox, time.Time, bool) {
+	rtspDetMtx.Lock()
+	var d = rtspDetectors[camID]
+	rtspDetMtx.Unlock()
+	if d == nil {
+		return nil, time.Time{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.lastBoxesAt.IsZero() || len(d.lastBoxes) == 0 {
+		return nil, time.Time{}, false
+	}
+	if maxAge > 0 && time.Since(d.lastBoxesAt) > maxAge {
+		return nil, d.lastBoxesAt, false
+	}
+	return append([]detBox(nil), d.lastBoxes...), d.lastBoxesAt, true
+}
 
 // streamSrc resolves the stream URL to read at this moment: the go2rtc relay
 // when preferRelay is set and go2rtc is running (dynamic, so a late go2rtc
@@ -504,6 +556,11 @@ func (d *rtspDetector) onBoxes(boxes []detBox) {
 	}
 	var debounce = time.Duration(getCamDebounce(d.camID, baseDeb)) * time.Second
 	d.mu.Lock()
+	// Remember the frame's boxes for snapshot pairing (Pushover best-frame
+	// selection). Stored before the allow-list filter: callers select the type
+	// they need and the live overlay already reports everything.
+	d.lastBoxes = append([]detBox(nil), boxes...)
+	d.lastBoxesAt = now
 	for _, b := range boxes {
 		if !d.types[b.Type] {
 			continue
@@ -814,6 +871,7 @@ func detectionRTSPStart(app *App) {
 		}
 		var camID = fmt.Sprintf("cam%d", i)
 		var d = newRTSPDetector(app, cam, camID)
+		registerRTSPDetector(d)
 		go d.watchdog()
 		go d.readLoop()
 		logIt(LINFO, "rtsp detection reader started", map[string]string{"camera": cam.Name, "transport": d.transport})
