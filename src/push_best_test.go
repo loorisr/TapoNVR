@@ -253,6 +253,27 @@ func TestPushoverSnapshotPickConfig(t *testing.T) {
 	}
 }
 
+func TestSegmentEndTime(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "seg.ts")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := time.Unix(1700000000, 0)
+	if err := os.Chtimes(p, want, want); err != nil {
+		t.Fatal(err)
+	}
+	if got := segmentEndTime(p); !got.Equal(want) {
+		t.Fatalf("segmentEndTime=%v want %v", got, want)
+	}
+	if got := segmentEnd(p); got != want.Unix() {
+		t.Fatalf("segmentEnd=%d want %d", got, want.Unix())
+	}
+	// Missing file falls back to now (never a zero time).
+	if got := segmentEndTime(filepath.Join(t.TempDir(), "missing.ts")); time.Since(got) > time.Second {
+		t.Fatalf("missing segment fallback too old: %v", got)
+	}
+}
+
 func TestDetectionTagList(t *testing.T) {
 	d := &Detection{detType: "motion", detTypes: "motion, person,,vehicle"}
 	got := strings.Join(detectionTagList(d), ",")

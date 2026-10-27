@@ -166,17 +166,27 @@ See `config.example.yaml` for the full file. Key settings:
 burst ends (bounded by `best_max_wait_s`, default 5 s) and attaches the frame
 with the largest SEI box matching the detection tags. Near-ties prefer a
 specific type (`person`/`vehicle`/`pet`) over a generic `motion` box, then the
-sharpest frame, then the most recent one. Boxes are ignored when the buffer
-image is older than ~1.5 s (so a stale IDR is never paired with newer boxes).
+sharpest frame, then the most recent one.
 
-Without usable boxes (ONVIF-only source, or no box in any candidate) the
-sharpest non-placeholder frame wins, then the primary. `primary` (the code
-default for existing configs) keeps the immediate trigger-frame behavior.
+In `best` mode the capture chain prefers the camera's **native snapshot** over
+the rolling-buffer IDR. The buffer only holds the last IDR, which can precede
+the SEI event by one GOP (often 1–2 s), so the subject may not be where the box
+says. A buffer frame is therefore **never** paired with live SEI boxes: boxes
+are only used with fresh sources, and a stale buffer IDR is retried against a
+live source first. Boxes are also dropped when the image and the box sample are
+more than ~1.5 s apart.
 
-The capture chain also retries a fresh native/RTSP grab when the rolling-buffer
-IDR is stale (>1.5 s) and keeps the old frame only as a last resort. Only the
-attached copy is affected: stored snapshots, S3 uploads and the primary shown in
-the UI are unchanged.
+Without usable boxes (ONVIF-only source, no fresh source, or no box in any
+candidate) the sharpest non-placeholder frame wins, then the primary. `primary`
+(the code default for existing configs) keeps the immediate trigger-frame
+behavior and the buffer-first capture order.
+
+Buffer frames are timestamped from the segment's mtime minus the IDR age inside
+the segment, so `image_age_ms` in the logs is real wall-clock age. The
+`snapshot boxes paired` (capture) and `pushover message sent` (`picked_source`,
+`picked_age_ms`, `picked_boxes`) logs make any remaining offset easy to check.
+Only the attached copy is affected: stored snapshots, S3 uploads and the primary
+shown in the UI are unchanged.
 
 ### Camera
 

@@ -112,7 +112,9 @@ alerts:
     # best waits for the timed snapshot burst then attaches the frame with the
     # largest matching SEI box (person/vehicle/pet/motion). Without boxes it
     # falls back to the sharpest frame, then to the primary. Box scoring needs
-    # detection.source rtsp|both (ONVIF-only cameras have no boxes).
+    # detection.source rtsp|both (ONVIF-only cameras have no boxes). In best
+    # mode a fresh native snapshot is preferred over the rolling-buffer IDR,
+    # which can lag the SEI event by one GOP.
     snapshot_pick: best
     # Max seconds to wait for the burst in best mode (0..10, 0 = no wait).
     best_max_wait_s: 5

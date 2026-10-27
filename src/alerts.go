@@ -565,6 +565,11 @@ func pushSend(app *App, t pushTicket, title string, message string, tags []strin
 	}
 	if snapOK && pick.path != "" {
 		fields["picked"] = filepath.Base(pick.path)
+		fields["picked_source"] = pick.source
+		fields["picked_boxes"] = fmt.Sprintf("%d", len(pick.boxes))
+		if !pick.at.IsZero() {
+			fields["picked_age_ms"] = fmt.Sprintf("%d", time.Since(pick.at).Milliseconds())
+		}
 	}
 	logIt(LINFO, "pushover message sent", fields)
 }
