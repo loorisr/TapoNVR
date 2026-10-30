@@ -1981,6 +1981,14 @@ type snapCandidate struct {
 	at          time.Time
 	source      string
 	placeholder bool
+	// index is the snapshot index used by /snapshot/{n} and vision_results:
+	// 0 = primary, 1..N = burst extras.
+	index int
+	// vision fields are filled when YOLO analysis was used to score/select
+	// this candidate (best mode) or when a stored result applies to it.
+	visionLabel string
+	visionConf  float64
+	visionCount int
 }
 
 // detSnapSet collects the candidates for one detection while the timed burst
@@ -2075,11 +2083,11 @@ func detectionSnapshotCandidates(d *Detection) []snapCandidate {
 	}
 	var out []snapCandidate
 	if d.snapshotPath != "" {
-		out = append(out, snapCandidate{path: d.snapshotPath})
+		out = append(out, snapCandidate{path: d.snapshotPath, index: 0})
 	}
 	for _, p := range strings.Split(d.extraSnap, ",") {
 		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, snapCandidate{path: p})
+			out = append(out, snapCandidate{path: p, index: len(out)})
 		}
 	}
 	return out
@@ -2113,15 +2121,15 @@ func snapStatusJSON(camID string) string {
 // collectDetection writes snapshot+clip for a detection and records it.
 // src is the RTSP URL, or "" to write test placeholder media.
 func collectDetection(app *App, camID string, camName string, src string, dtype string) (*Detection, error) {
-	return collectDetectionWithID(app, camID, camName, src, dtype, newID(), "")
+	return collectDetectionWithID(app, camID, camName, src, dtype, newID(), "test", "")
 }
 
 // collectDetectionWithID is collectDetection with a caller-provided id. The
 // grouping layer reserves the id (and its active-rec slot) BEFORE the slow
 // snapshot capture so concurrent events extend this group instead of forking
-// a second one. bbox is the triggering frame's RTSP SEI boxes (JSON, "" for
-// ONVIF events).
-func collectDetectionWithID(app *App, camID string, camName string, src string, dtype string, id string, bbox string) (*Detection, error) {
+// a second one. srcKind records the detection source (onvif, rtsp, test).
+// bbox is the triggering frame's RTSP SEI boxes (JSON, "" for ONVIF events).
+func collectDetectionWithID(app *App, camID string, camName string, src string, dtype string, id string, srcKind string, bbox string) (*Detection, error) {
 	var base = app.cfg.Server.DataDir + "/detections/" + time.Now().Local().Format("2006-01-02") + "/" + camID
 	if err := ensureDir(base); err != nil {
 		return nil, err
@@ -2284,6 +2292,7 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	d.camName = camName
 	d.detType = normalizeDetType(dtype)
 	d.detTypes = d.detType
+	d.detSource = normalizeDetSource(srcKind)
 	d.confidence = 0.9
 	d.startedAt = now - int64(app.cfg.Record.PreDetection)
 	d.endedAt = endedAt
@@ -2326,6 +2335,9 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 		}
 		if cur.detTypes != "" {
 			d.detTypes = cur.detTypes
+		}
+		if cur.detSource != "" {
+			d.detSource = mergeDetSourceList(d.detSource, cur.detSource)
 		}
 	}
 	if d.detTypes == "" {
@@ -2527,7 +2539,7 @@ func captureSnapshotBurstMeta(app *App, base string, detID string, camID string,
 						boxes = nil // image and boxes are too far apart to trust
 					}
 				}
-				onSnap(snapCandidate{path: p, boxes: boxes, at: g.imageAt, source: g.source})
+				onSnap(snapCandidate{path: p, boxes: boxes, at: g.imageAt, source: g.source, index: i})
 				logIt(LDEBUG, "snapshot boxes paired", map[string]string{
 					"camera": camID, "snapshot": strconv.Itoa(i), "source": source,
 					"boxes":        strconv.Itoa(len(boxes)),

@@ -597,7 +597,7 @@ func (d *rtspDetector) onBoxes(boxes []detBox) {
 		}
 		go func(dt, bj string) {
 			defer detEventRelease(d.camID)
-			handleRawDetectionEvent(d.app, d.camID, d.camName, dt, d.streamSrc(), bj)
+			handleRawDetectionEvent(d.app, d.camID, d.camName, dt, d.streamSrc(), "rtsp", bj)
 		}(dtype, bjson)
 	}
 }

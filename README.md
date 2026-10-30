@@ -158,7 +158,7 @@ See `config.example.yaml` for the full file. Key settings:
 | `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent) |
 | `detection.source` | `onvif` (webhook, type only — default), `rtsp` (camera AI boxes + type from H.264 SEI), or `both` |
 | `detection.rtsp.*` | SEI reader tuning: `transport`, `debounce_s`, `hold_s`, `types`, `use_go2rtc` |
-| `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; `snapshot_pick: best` waits for the burst and attaches the frame with the largest matching SEI box — sharpness fallback; oversized copies fall back to text-only) |
+| `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; `snapshot_pick: best` waits for the burst and attaches the best frame — YOLO class/confidence when `vision.enabled`, else the largest matching SEI box with sharpness fallback; oversized copies fall back to text-only). Messages include the detection source (ONVIF/RTSP/manual/test), the camera identification and the YOLO label + confidence when available. |
 
 ### Pushover: best attached frame
 
@@ -167,6 +167,24 @@ burst ends (bounded by `best_max_wait_s`, default 5 s) and attaches the frame
 with the largest SEI box matching the detection tags. Near-ties prefer a
 specific type (`person`/`vehicle`/`pet`) over a generic `motion` box, then the
 sharpest frame, then the most recent one.
+
+When `vision.enabled` is true, `best` mode also sends the burst candidates to
+the YOLO API (at most 12 candidates, four concurrent, short time budget) and
+picks the frame with the most relevant class and highest confidence
+(`person`/`vehicle`/`pet` mapping, with `motion`/`other` as wildcards). If no
+candidate has a matching YOLO box, selection falls back to the SEI
+box/sharpness heuristic. This works even when `vision.snapshots: primary`:
+the extra frames are analyzed for this attachment decision and their results
+are stored for the UI.
+
+Every Pushover message names the detection source (`ONVIF`, `RTSP`, `ONVIF +
+RTSP`, `Manual` or `Test`) and the identification sources, for example:
+
+```text
+person detected on camera-1
+Detection source: RTSP
+Identification: camera=person,motion | YOLO=person 86% (3 boxes)
+```
 
 In `best` mode the capture chain prefers the camera's **native snapshot** over
 the rolling-buffer IDR. The buffer only holds the last IDR, which can precede
@@ -369,7 +387,7 @@ from the event time).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/detections?camera=&type=` | Detection timeline (`&label=person&has_vision=1` filters YOLO results); `type` matches any merged tag, and each row carries `type` (primary), `types` (all merged tags) and `bbox` (RTSP SEI boxes, `null` when none) |
+| `GET /api/detections?camera=&type=` | Detection timeline (`&label=person&has_vision=1` filters YOLO results); `type` matches any merged tag, and each row carries `type` (primary), `types` (all merged tags), `source` (onvif/rtsp/manual/test, merged when both paths contributed) and `bbox` (RTSP SEI boxes, `null` when none) |
 | `GET /api/detections/{id}/snapshot` | Snapshot JPEG |
 | `GET /api/detections/{id}/snapshot?boxes=1` | Snapshot JPEG with boxes burned in (its own YOLO result, else the camera's RTSP SEI boxes; serve-time only, stored file untouched; plain JPEG when neither applies) |
 | `GET /api/detections/{id}/clip` | Clip MP4 |
@@ -512,6 +530,15 @@ For RTSP detection, watch the startup log for `rtsp detection reader started` /
 `rtsp detection connected`, and the Status tab for the per-camera source and RTSP
 box counters. `go test ./src -count=1` runs the SEI parser / state-machine unit
 tests (synthetic metadata, no camera needed).
+
+The YOLO-assisted best-frame selection has an optional live test (skipped by
+default) that can be run against a vision sidecar with two sample images:
+
+```sh
+TAPONVR_VISION_TEST_URL=http://192.168.10.120:8080 \
+TAPONVR_VISION_BUS=/tmp/bus.jpg TAPONVR_VISION_EMPTY=/tmp/empty.jpg \
+go test ./src -run TestLiveVisionBestPick -v -count=1
+```
 
 ## Updating dependencies
 

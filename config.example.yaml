@@ -109,12 +109,12 @@ alerts:
     # JPEG quality 1-100 of the attached copy (stored snapshot untouched).
     snapshot_quality: 70
     # Attached frame: primary sends the trigger-frame snapshot immediately;
-    # best waits for the timed snapshot burst then attaches the frame with the
-    # largest matching SEI box (person/vehicle/pet/motion). Without boxes it
-    # falls back to the sharpest frame, then to the primary. Box scoring needs
-    # detection.source rtsp|both (ONVIF-only cameras have no boxes). In best
-    # mode a fresh native snapshot is preferred over the rolling-buffer IDR,
-    # which can lag the SEI event by one GOP.
+    # best waits for the timed snapshot burst then attaches the best frame.
+    # With vision.enabled, best scores the burst candidates with YOLO
+    # (most relevant class + highest confidence) and falls back to the largest
+    # matching SEI box / sharpness when no box matches. The message always
+    # names the detection source (ONVIF/RTSP/manual/test), the camera
+    # identification and the YOLO label + confidence when available.
     snapshot_pick: best
     # Max seconds to wait for the burst in best mode (0..10, 0 = no wait).
     best_max_wait_s: 5

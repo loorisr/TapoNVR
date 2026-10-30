@@ -84,6 +84,7 @@ func detJSON(d *Detection) string {
 	arr = append(arr, kv("camera_id", d.cameraID))
 	arr = append(arr, kv("camera_name", d.camName))
 	arr = append(arr, kv("type", d.detType))
+	arr = append(arr, kv("source", d.detSource))
 	// types is the full merged tag list (primary first), e.g. ["person","motion"].
 	var tagJSON []string
 	for _, t := range detectionTags(d) {
@@ -695,6 +696,7 @@ func handleCameraSnapshot(app *App, w http.ResponseWriter, r *http.Request, path
 		endedAt:      nowMs,
 		snapshotPath: dest,
 		clipPath:     "",
+		detSource:    "manual",
 	}
 	d.sizeBytes = detectionSize(&d)
 	if s3UploadEnabled() {
@@ -916,7 +918,7 @@ func runLegacyManualRecord(app *App, job *manualJob, cam *CameraCfg, camID strin
 		return
 	}
 	nowMs := time.Now().Unix()
-	d := Detection{id: newID(), cameraID: camID, camName: cam.Name, detType: "manual-video", confidence: 1.0, startedAt: now.Unix(), endedAt: nowMs, snapshotPath: "", clipPath: dest}
+	d := Detection{id: newID(), cameraID: camID, camName: cam.Name, detType: "manual-video", confidence: 1.0, startedAt: now.Unix(), endedAt: nowMs, snapshotPath: "", clipPath: dest, detSource: "manual"}
 	tmpSnap := dir + "/" + friendlyTS(now.Unix()) + "-" + d.id + "-manual-thumb.jpg"
 	if _, ok := grabSnapshotChain(app, camID, tmpSnap); ok {
 		d.snapshotPath = tmpSnap
@@ -1062,7 +1064,7 @@ func stopManualRecord(app *App, camID string) (string, error) {
 		}
 	}
 	nowMs := time.Now().Unix()
-	d := Detection{id: st.id, cameraID: camID, camName: camName, detType: "manual-video", confidence: 1.0, startedAt: st.start, endedAt: nowMs, snapshotPath: "", clipPath: finalDest}
+	d := Detection{id: st.id, cameraID: camID, camName: camName, detType: "manual-video", confidence: 1.0, startedAt: st.start, endedAt: nowMs, snapshotPath: "", clipPath: finalDest, detSource: "manual"}
 	// thumbnail (buffer → native → rtsp → http)
 	dir := app.cfg.Server.DataDir + "/manual/" + camID
 	tmpSnap := dir + "/" + friendlyTS(st.start) + "-" + st.id + "-manual-thumb.jpg"

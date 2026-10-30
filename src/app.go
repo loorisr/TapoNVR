@@ -135,6 +135,9 @@ type activeRec struct {
 	// the DB row exists.
 	detType  string
 	detTypes string
+	// detSource mirrors det_types for the detection source(s): onvif, rtsp,
+	// manual or test, comma-separated when a group is fed by both paths.
+	detSource string
 	// established is false while the reserving collectDetection is still
 	// running (its DB row may not exist yet) and true once inserted.
 	// Only established slots get ghost-checked against the DB.
@@ -200,6 +203,18 @@ func addActiveRecType(camID string, id string, dtype string) (primary string, pr
 	return r.detType, detTypeRank(r.detType) > before
 }
 
+// addActiveRecSource merges a detection source into the reservation's source
+// list while the row is still being captured. Callers hold groupMtx.
+func addActiveRecSource(camID string, id string, src string) {
+	activeRecMtx.Lock()
+	defer activeRecMtx.Unlock()
+	var r = activeRecMap[camID]
+	if r == nil || r.id != id {
+		return
+	}
+	r.detSource = mergeDetSourceList(r.detSource, src)
+}
+
 func extendActiveRec(camID string, now int64, postSec int64) (string, bool) {
 	activeRecMtx.Lock()
 	defer activeRecMtx.Unlock()
@@ -234,7 +249,7 @@ func confirmActiveRec(camID string, id string, endAt int64) {
 		if r.endAt > endAt {
 			endAt = r.endAt
 		}
-		activeRecMap[camID] = &activeRec{id: r.id, firstAt: r.firstAt, lastAt: time.Now().Unix(), endAt: endAt, detType: r.detType, detTypes: r.detTypes, established: true}
+		activeRecMap[camID] = &activeRec{id: r.id, firstAt: r.firstAt, lastAt: time.Now().Unix(), endAt: endAt, detType: r.detType, detTypes: r.detTypes, detSource: r.detSource, established: true}
 		return
 	}
 	if _, ok := activeRecMap[camID]; ok {
@@ -258,12 +273,14 @@ func clearAllActiveRecs() {
 // start a new recording or extend the current one.
 // Returns true if a new recording was started.
 func handleRawOnvifEvent(app *App, camID string, camName string, dtype string, src string) bool {
-	return handleRawDetectionEvent(app, camID, camName, dtype, src, "")
+	return handleRawDetectionEvent(app, camID, camName, dtype, src, "onvif", "")
 }
 
 // handleRawDetectionEvent is the shared ingestion path for ONVIF webhook events
 // (bbox = "") and RTSP SEI boxes (bbox = JSON array from the camera's stream).
-func handleRawDetectionEvent(app *App, camID string, camName string, dtype string, src string, bbox string) bool {
+// srcKind records where the event came from (onvif, rtsp, test, manual) so
+// alerts can name the detection source.
+func handleRawDetectionEvent(app *App, camID string, camName string, dtype string, src string, srcKind string, bbox string) bool {
 	var now = time.Now().Unix()
 	if !detectionEnabled() {
 		var ev0 = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: "", bbox: bbox}
@@ -304,11 +321,12 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 	var detID string
 	if !extended {
 		detID = newID()
-		setActiveRec(camID, &activeRec{id: detID, firstAt: now, lastAt: now, endAt: now + postSec, detType: normalizeDetType(dtype), detTypes: normalizeDetType(dtype)})
+		setActiveRec(camID, &activeRec{id: detID, firstAt: now, lastAt: now, endAt: now + postSec, detType: normalizeDetType(dtype), detTypes: normalizeDetType(dtype), detSource: normalizeDetSource(srcKind)})
 	} else {
 		// Merge the tag into the reservation even while the DB row is still
 		// being written by the reserving collectDetection.
 		addActiveRecType(camID, extID, dtype)
+		addActiveRecSource(camID, extID, srcKind)
 	}
 	groupMtx.Unlock()
 	if extended {
@@ -325,6 +343,11 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 			if err := dbMergeBBox(app.db, extID, bbox); err != nil {
 				logIt(LWARN, "db bbox merge failed", map[string]string{"error": err.Error()})
 			}
+		}
+		// Merge the detection source first so a promotion alert below reads the
+		// complete source list (e.g. "rtsp,onvif").
+		if _, serr := dbMergeDetectionSource(app.db, extID, srcKind); serr != nil {
+			logIt(LWARN, "db source merge failed", map[string]string{"error": serr.Error()})
 		}
 		// Merge the tag into the DB row (no-op while the row does not exist
 		// yet: the reserving collectDetection writes the in-memory slot tags).
@@ -347,7 +370,7 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 	}
 	// 3) fresh recording with the reserved id (collectDetection merges any
 	// extensions that landed during capture into the final end time)
-	var det, err = collectDetectionWithID(app, camID, camName, src, dtype, detID, bbox)
+	var det, err = collectDetectionWithID(app, camID, camName, src, dtype, detID, srcKind, bbox)
 	if err != nil || det == nil {
 		// Don't leave a phantom slot that would swallow future events.
 		clearActiveRec(camID, detID)

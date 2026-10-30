@@ -151,10 +151,327 @@ func pushoverEventAllowed(p PushoverCfg, eventType string) bool {
 }
 
 // pushoverPickBest reports whether the attached frame should be chosen after
-// the timed snapshot burst (largest matching SEI box, sharpness fallback)
-// instead of sending the trigger-frame snapshot immediately.
+// the timed snapshot burst (YOLO class/confidence when vision is enabled,
+// otherwise the largest matching SEI box with a sharpness fallback) instead of
+// sending the trigger-frame snapshot immediately.
 func pushoverPickBest(p PushoverCfg) bool {
 	return strings.EqualFold(strings.TrimSpace(p.SnapshotPick), "best")
+}
+
+// detSourceLabel renders the stored detection source list for humans:
+// "onvif,rtsp" -> "ONVIF + RTSP". Empty/unknown values are labelled so an old
+// row never produces a blank "Source:" line.
+func detSourceLabel(raw string) string {
+	var out []string
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		switch strings.ToLower(s) {
+		case "onvif":
+			out = append(out, "ONVIF")
+		case "rtsp":
+			out = append(out, "RTSP")
+		case "manual":
+			out = append(out, "Manual")
+		case "test":
+			out = append(out, "Test")
+		default:
+			out = append(out, strings.ToUpper(s[:1])+s[1:])
+		}
+	}
+	if len(out) == 0 {
+		return "unknown"
+	}
+	return strings.Join(out, " + ")
+}
+
+// ---------------- alerts: YOLO-assisted best snapshot ----------------
+
+// visionVehicleLabels / visionPetLabels map COCO labels to the camera's coarse
+// detection tags so a "vehicle" event can match car/truck/bus boxes.
+var visionVehicleLabels = map[string]bool{
+	"car": true, "truck": true, "bus": true, "motorcycle": true,
+	"bicycle": true, "train": true, "boat": true, "airplane": true,
+	"van": true, "suv": true,
+}
+
+var visionPetLabels = map[string]bool{
+	"dog": true, "cat": true, "bird": true, "horse": true, "sheep": true,
+	"cow": true, "elephant": true, "bear": true, "zebra": true, "giraffe": true,
+}
+
+// visionTagRank scores how well a YOLO label matches the detection's camera
+// tags: 2 = specific match (person/vehicle/pet/custom), 1 = generic
+// motion/other wildcard, 0 = no match. A specific match always beats a
+// wildcard, so a merged "motion,person" event prefers a person box over a
+// higher-confidence car box.
+func visionTagRank(label string, tags []string) int {
+	label = normalizeDetType(label)
+	if label == "" {
+		return 0
+	}
+	if len(tags) == 0 {
+		return 1
+	}
+	var best int
+	for _, tag := range tags {
+		switch normalizeDetType(tag) {
+		case "person":
+			if label == "person" && best < 2 {
+				best = 2
+			}
+		case "vehicle":
+			if visionVehicleLabels[label] && best < 2 {
+				best = 2
+			}
+		case "pet":
+			if visionPetLabels[label] && best < 2 {
+				best = 2
+			}
+		case "motion", "other":
+			if best < 1 {
+				best = 1
+			}
+		default:
+			if label == normalizeDetType(tag) && best < 2 {
+				best = 2
+			}
+		}
+	}
+	return best
+}
+
+// visionBoxArea returns the normalized box area (0..1).
+func visionBoxArea(b visionBox) float64 {
+	var x1, y1 = clamp01f(b.XMin), clamp01f(b.YMin)
+	var x2, y2 = clamp01f(b.XMax), clamp01f(b.YMax)
+	var w, h = x2 - x1, y2 - y1
+	if w <= 0 || h <= 0 {
+		return 0
+	}
+	return w * h
+}
+
+// visionMatch is the best YOLO detection for the camera tags of one snapshot.
+type visionMatch struct {
+	label   string
+	conf    float64
+	area    float64
+	rank    int
+	matched bool
+}
+
+// visionBestMatch returns the most relevant detection for tags: specific class
+// matches first, then confidence, then box area.
+func visionBestMatch(dets []visionDetection, tags []string) visionMatch {
+	var best visionMatch
+	for _, d := range dets {
+		var rank = visionTagRank(d.Label, tags)
+		if rank == 0 {
+			continue
+		}
+		var area = visionBoxArea(d.BoxNorm)
+		var better bool
+		if !best.matched {
+			better = true
+		} else if rank != best.rank {
+			better = rank > best.rank
+		} else if d.Confidence > best.conf+0.005 {
+			better = true
+		} else if d.Confidence >= best.conf-0.005 && area > best.area {
+			better = true
+		}
+		if better {
+			best = visionMatch{label: d.Label, conf: d.Confidence, area: area, rank: rank, matched: true}
+		}
+	}
+	return best
+}
+
+// visionTopDetection returns the highest-confidence box overall (used for the
+// message when no box matches the camera tags).
+func visionTopDetection(dets []visionDetection) (string, float64, float64, bool) {
+	var label string
+	var conf, area float64
+	var ok bool
+	for _, d := range dets {
+		if !ok || d.Confidence > conf {
+			label, conf, area, ok = d.Label, d.Confidence, visionBoxArea(d.BoxNorm), true
+		}
+	}
+	return label, conf, area, ok
+}
+
+// Bounds for YOLO-assisted frame selection: analyze at most 12 candidates,
+// four at a time, and never hold the alert longer than the budget.
+const (
+	visionPushMaxCandidates = 12
+	visionPushWorkers       = 4
+)
+
+// visionResultsForPush returns a YOLO result per candidate path, reusing
+// stored per-snapshot results and analyzing the rest concurrently. The alert
+// is bounded by a short budget; late analyses still persist in the background.
+func visionResultsForPush(app *App, det *Detection, cands []snapCandidate) map[string]*visionResult {
+	var out = map[string]*visionResult{}
+	if app == nil || det == nil || len(cands) == 0 {
+		return out
+	}
+	var todo []snapCandidate
+	for _, c := range cands {
+		if c.path == "" || c.placeholder {
+			continue
+		}
+		if _, ok := out[c.path]; ok {
+			continue
+		}
+		if vr, err := dbGetVisionResult(app.db, det.id, c.path); err == nil && vr != nil && vr.err == "" {
+			out[c.path] = &visionResult{Detections: parseVisionDets(vr.json), InferenceMs: vr.ms}
+			continue
+		}
+		if len(todo) < visionPushMaxCandidates {
+			todo = append(todo, c)
+		}
+	}
+	if len(todo) == 0 {
+		return out
+	}
+	// Per-request timeouts are bounded by vision.timeout_s; cap the whole
+	// selection phase so a slow sidecar cannot delay the alert for minutes.
+	var budget = time.Duration(app.cfg.Vision.TimeoutS) * time.Second
+	if budget <= 0 || budget > 6*time.Second {
+		budget = 6 * time.Second
+	}
+	type result struct {
+		path string
+		vr   *visionResult
+	}
+	var ch = make(chan result, len(todo))
+	var sem = make(chan struct{}, visionPushWorkers)
+	for _, c := range todo {
+		go func(c snapCandidate) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var vr, err = visionAnalyzeFile(app, c.path)
+			if err != nil {
+				visionNoteFailure()
+				logIt(LDEBUG, "vision best-frame analyze failed", map[string]string{"id": det.id, "path": c.path, "error": err.Error()})
+				return
+			}
+			visionNoteSuccess()
+			if err := dbUpsertVisionResult(app.db, det.id, c.index, c.path, vr, "", time.Now().Unix()); err != nil {
+				logIt(LWARN, "vision best-frame store failed", map[string]string{"id": det.id, "error": err.Error()})
+			}
+			ch <- result{path: c.path, vr: vr}
+		}(c)
+	}
+	var deadline = time.After(budget)
+	for i := 0; i < len(todo); i++ {
+		select {
+		case r := <-ch:
+			out[r.path] = r.vr
+		case <-deadline:
+			logIt(LWARN, "vision best-frame selection timed out", map[string]string{"id": det.id, "analyzed": fmt.Sprintf("%d/%d", len(out), len(todo))})
+			return out
+		}
+	}
+	return out
+}
+
+// pickBestFromVisionResults ranks candidates by their YOLO match. It returns
+// ok=false when no candidate has a detection matching the camera tags.
+func pickBestFromVisionResults(cands []snapCandidate, tags []string, results map[string]*visionResult) (snapCandidate, *visionResult, bool) {
+	var best snapCandidate
+	var bestMatch visionMatch
+	var bestOK bool
+	for _, c := range cands {
+		if c.path == "" || c.placeholder {
+			continue
+		}
+		var vr = results[c.path]
+		if vr == nil {
+			continue
+		}
+		var m = visionBestMatch(vr.Detections, tags)
+		if !m.matched {
+			continue
+		}
+		var better bool
+		if !bestOK {
+			better = true
+		} else if m.rank != bestMatch.rank {
+			better = m.rank > bestMatch.rank
+		} else if m.conf > bestMatch.conf+0.005 {
+			better = true
+		} else if m.conf >= bestMatch.conf-0.005 && m.area > bestMatch.area {
+			better = true
+		}
+		if better {
+			best, bestMatch, bestOK = c, m, true
+		}
+	}
+	if !bestOK {
+		return snapCandidate{}, nil, false
+	}
+	best.visionLabel = bestMatch.label
+	best.visionConf = bestMatch.conf
+	best.visionCount = len(results[best.path].Detections)
+	return best, results[best.path], true
+}
+
+// pickBestSnapshotWithVision chooses the frame using YOLO when it is enabled:
+// among candidates with a matching detection, the most specific class tag wins,
+// then confidence, then box area. Without a usable YOLO match it falls back to
+// the existing SEI-box/sharpness heuristic.
+func pickBestSnapshotWithVision(app *App, det *Detection, cands []snapCandidate, tags []string) (snapCandidate, *visionResult) {
+	if app == nil || det == nil || !visionShouldAnalyze(app) || len(cands) == 0 {
+		return pickBestSnapshot(cands, tags), nil
+	}
+	var results = visionResultsForPush(app, det, cands)
+	if len(results) == 0 {
+		return pickBestSnapshot(cands, tags), nil
+	}
+	if best, vr, ok := pickBestFromVisionResults(cands, tags, results); ok {
+		return best, vr
+	}
+	// No candidate matched the camera tags: keep the legacy pick and only
+	// report a YOLO result when one exists for that exact frame.
+	var fallback = pickBestSnapshot(cands, tags)
+	var vr = results[fallback.path]
+	if vr != nil {
+		if label, conf, _, ok := visionTopDetection(vr.Detections); ok {
+			fallback.visionLabel, fallback.visionConf = label, conf
+		}
+		fallback.visionCount = len(vr.Detections)
+	}
+	return fallback, vr
+}
+
+// pushDetailMessage appends the detection source, camera identification and
+// YOLO result (with confidence) to the human message.
+func pushDetailMessage(message string, d *Detection, pick snapCandidate) string {
+	if d == nil {
+		return message
+	}
+	var lines []string
+	lines = append(lines, "Detection source: "+detSourceLabel(d.detSource))
+	var parts []string
+	if tags := detectionTags(d); len(tags) > 0 {
+		parts = append(parts, "camera="+strings.Join(tags, ","))
+	}
+	if pick.visionLabel != "" && pick.visionConf > 0 {
+		var p = fmt.Sprintf("YOLO=%s %.0f%%", pick.visionLabel, pick.visionConf*100)
+		if pick.visionCount > 1 {
+			p += fmt.Sprintf(" (%d boxes)", pick.visionCount)
+		}
+		parts = append(parts, p)
+	}
+	if len(parts) > 0 {
+		lines = append(lines, "Identification: "+strings.Join(parts, " | "))
+	}
+	return message + "\n" + strings.Join(lines, "\n")
 }
 
 // pushTicket is a prepared Pushover send: config snapshot + reserved throttle
@@ -216,22 +533,29 @@ func pushNotify(app *App, eventType string, title string, message string, snapPa
 	if snapPath != "" {
 		cands = append(cands, snapCandidate{path: snapPath})
 	}
-	pushNotifyCandidates(app, eventType, title, message, cands)
+	pushNotifyCandidates(app, eventType, title, message, nil, cands)
 }
 
-func pushNotifyCandidates(app *App, eventType string, title string, message string, cands []snapCandidate) {
+func pushNotifyCandidates(app *App, eventType string, title string, message string, det *Detection, cands []snapCandidate) {
 	var t = pushPrepare(app, eventType, title)
 	if !t.ok {
 		return
 	}
-	pushSend(app, t, title, message, []string{eventType}, cands)
+	var tags = []string{eventType}
+	if det != nil {
+		if tl := detectionTagList(det); len(tl) > 0 {
+			tags = tl
+		}
+	}
+	pushSend(app, t, title, message, tags, cands, det)
 }
 
 // pushNotifyBest waits (bounded by maxWait) for the snapshot burst to finish,
-// then attaches the best frame among the candidates. When the burst/lookup is
-// unavailable it falls back to fallback (the primary snapshot) and finally to
-// a text-only alert.
-func pushNotifyBest(app *App, eventType string, title string, message string, detID string, set *detSnapSet, fallback string, maxWait time.Duration) {
+// then attaches the best frame among the candidates. When YOLO is enabled the
+// candidates are scored by class/confidence (fallback: SEI box/sharpness).
+// When the burst/lookup is unavailable it falls back to the primary snapshot
+// and finally to a text-only alert.
+func pushNotifyBest(app *App, eventType string, title string, message string, det *Detection, set *detSnapSet, fallback string, maxWait time.Duration) {
 	var t = pushPrepare(app, eventType, title)
 	if !t.ok {
 		return
@@ -245,28 +569,26 @@ func pushNotifyBest(app *App, eventType string, title string, message string, de
 		cands = append(cands, snapCandidate{path: fallback})
 	}
 	var tags = []string{eventType}
-	if detID != "" {
-		if d, err := getDetection(app.db, detID); err == nil && d != nil {
-			if tl := detectionTagList(d); len(tl) > 0 {
-				tags = tl
-			}
+	if det != nil {
+		if tl := detectionTagList(det); len(tl) > 0 {
+			tags = tl
 		}
 	}
-	pushSend(app, t, title, message, tags, cands)
+	pushSend(app, t, title, message, tags, cands, det)
 }
 
 // pushNotifyDetection is the detection-aware entry point used by the initial
 // alert and by tag-promotion alerts. In "best" mode it reuses the in-flight
 // candidate set (boxes included) or, when the set is gone, all stored snapshots
 // (sharpness fallback). In "primary" mode it keeps the legacy single-snapshot
-// behavior.
+// behavior. Source and YOLO details are added to the message for both modes.
 func pushNotifyDetection(app *App, eventType string, title string, message string, det *Detection, set *detSnapSet) {
 	if det == nil {
 		return
 	}
 	if !app.cfg.Alerts.Pushover.SendSnapshot {
 		// No frame to pick: do not make the alert wait for the burst.
-		pushNotify(app, eventType, title, message, "")
+		pushNotifyCandidates(app, eventType, title, message, det, nil)
 		return
 	}
 	if pushoverPickBest(app.cfg.Alerts.Pushover) {
@@ -274,13 +596,13 @@ func pushNotifyDetection(app *App, eventType string, title string, message strin
 			set = detSnapSetByID(det.id)
 		}
 		if set != nil {
-			pushNotifyBest(app, eventType, title, message, det.id, set, det.snapshotPath, time.Duration(app.cfg.Alerts.Pushover.BestMaxWaitS)*time.Second)
+			pushNotifyBest(app, eventType, title, message, det, set, det.snapshotPath, time.Duration(app.cfg.Alerts.Pushover.BestMaxWaitS)*time.Second)
 			return
 		}
-		pushNotifyCandidates(app, eventType, title, message, detectionSnapshotCandidates(det))
+		pushNotifyCandidates(app, eventType, title, message, det, detectionSnapshotCandidates(det))
 		return
 	}
-	pushNotify(app, eventType, title, message, det.snapshotPath)
+	pushNotifyCandidates(app, eventType, title, message, det, []snapCandidate{{path: det.snapshotPath}})
 }
 
 // detectionTagList returns the detection's merged tags (primary first), used
@@ -496,20 +818,38 @@ func imageSharpness(raw []byte) float64 {
 
 // pushSend attaches the chosen frame and performs the HTTP request. Errors are
 // logged and swallowed; the throttle slot is rolled back on failure.
-func pushSend(app *App, t pushTicket, title string, message string, tags []string, cands []snapCandidate) {
+func pushSend(app *App, t pushTicket, title string, message string, tags []string, cands []snapCandidate, det *Detection) {
 	var p = t.cfg
 	var pick snapCandidate
 	var snap []byte
 	if p.SendSnapshot && len(cands) > 0 {
-		if len(cands) == 1 {
+		if det != nil && pushoverPickBest(p) && visionShouldAnalyze(app) {
+			// Best mode with YOLO enabled: score the candidate frames and pick
+			// the most relevant/highest-confidence match.
+			pick, _ = pickBestSnapshotWithVision(app, det, cands, tags)
+		} else if len(cands) == 1 {
 			pick = cands[0] // nothing to choose: skip the extra decode
 		} else {
 			pick = pickBestSnapshot(cands, tags)
+		}
+		// Primary mode (or fallback): never block on a fresh analysis, but
+		// report a result already stored by the async vision worker.
+		if pick.path != "" && pick.visionLabel == "" && det != nil {
+			if vr, err := dbGetVisionResult(app.db, det.id, pick.path); err == nil && vr != nil && vr.count > 0 {
+				var dets = parseVisionDets(vr.json)
+				pick.visionCount = len(dets)
+				if m := visionBestMatch(dets, tags); m.matched {
+					pick.visionLabel, pick.visionConf = m.label, m.conf
+				} else if label, conf, _, ok := visionTopDetection(dets); ok {
+					pick.visionLabel, pick.visionConf = label, conf
+				}
+			}
 		}
 		if pick.path != "" {
 			snap = pushAttachment(p, pick.path)
 		}
 	}
+	message = pushDetailMessage(message, det, pick)
 	var snapOK = len(snap) > 0
 	var ctype string
 	var body io.Reader
@@ -562,6 +902,14 @@ func pushSend(app *App, t pushTicket, title string, message string, tags []strin
 		"message":       message,
 		"with_snapshot": map[bool]string{true: "true", false: "false"}[snapOK],
 		"attach_bytes":  fmt.Sprintf("%d", len(snap)),
+	}
+	if det != nil {
+		fields["det_source"] = det.detSource
+	}
+	if pick.visionLabel != "" {
+		fields["vision_label"] = pick.visionLabel
+		fields["vision_conf"] = fmt.Sprintf("%.2f", pick.visionConf)
+		fields["vision_boxes"] = fmt.Sprintf("%d", pick.visionCount)
 	}
 	if snapOK && pick.path != "" {
 		fields["picked"] = filepath.Base(pick.path)

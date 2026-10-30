@@ -99,6 +99,9 @@ func openDB(path string) (*DB, error) {
 		// Merged camera tags per detection (e.g. "motion,person"). det_type
 		// stays the primary/most-specific tag for filters/retention.
 		"ALTER TABLE detections ADD COLUMN det_types TEXT DEFAULT ''",
+		// Source(s) that produced the detection: onvif, rtsp, manual, test.
+		// Merged detections keep every source that extended the group.
+		"ALTER TABLE detections ADD COLUMN det_source TEXT DEFAULT ''",
 	} {
 		if _, err := store.db.Exec(mig); err != nil {
 			logIt(LDEBUG, "db migration skipped", map[string]string{"sql": mig, "error": err.Error()})
@@ -187,7 +190,7 @@ func dbInsertDetection(store *DB, d *Detection) error {
 	if strings.TrimSpace(detTypes) == "" {
 		detTypes = d.detType
 	}
-	_, e := store.db.Exec("INSERT INTO detections(id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, uploaded, s3_expected, size_bytes, bbox_json, det_types) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)", d.id, d.cameraID, d.camName, d.detType, d.confidence, d.startedAt, d.endedAt, d.snapshotPath, d.clipPath, d.s3Expected, d.sizeBytes, d.bboxJSON, detTypes)
+	_, e := store.db.Exec("INSERT INTO detections(id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, uploaded, s3_expected, size_bytes, bbox_json, det_types, det_source) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)", d.id, d.cameraID, d.camName, d.detType, d.confidence, d.startedAt, d.endedAt, d.snapshotPath, d.clipPath, d.s3Expected, d.sizeBytes, d.bboxJSON, detTypes, d.detSource)
 	return e
 }
 
@@ -198,6 +201,44 @@ func dbInsertDetection(store *DB, d *Detection) error {
 func normalizeDetType(t string) string {
 	t = strings.ToLower(strings.TrimSpace(t))
 	return strings.ReplaceAll(t, ",", "")
+}
+
+// normalizeDetSource normalizes one detection-source tag. Unknown values are
+// kept as their lower-cased form so future sources render sensibly.
+func normalizeDetSource(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, ",", "")
+	switch s {
+	case "onvif", "rtsp", "manual", "test":
+		return s
+	default:
+		return s
+	}
+}
+
+// mergeDetSourceList appends every source in adds to existing, de-duplicating
+// and preserving first-seen order. Sources are comma-separated (e.g.
+// "rtsp,onvif" when both paths extended the same grouped detection).
+func mergeDetSourceList(existing string, adds ...string) string {
+	var out []string
+	var seen = map[string]bool{}
+	var addOne = func(raw string) {
+		var s = normalizeDetSource(raw)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range strings.Split(existing, ",") {
+		addOne(s)
+	}
+	for _, add := range adds {
+		for _, s := range strings.Split(add, ",") {
+			addOne(s)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // parseDetTypes splits a stored det_types value into individual tags.
@@ -370,6 +411,35 @@ func dbMergeDetectionType(store *DB, id, dtype string) (found bool, promoted boo
 	return true, detTypeRank(primary) > before, err
 }
 
+// dbMergeDetectionSource merges a detection-source tag into the row. Sources
+// are comma-separated in first-seen order (e.g. "rtsp,onvif" when both paths
+// contributed to the same grouped detection). found is false when the row does
+// not exist yet (the reserving collectDetection is still running).
+var detSourceMergeMtx sync.Mutex
+
+func dbMergeDetectionSource(store *DB, id, src string) (found bool, err error) {
+	src = normalizeDetSource(src)
+	if src == "" {
+		return true, nil
+	}
+	detSourceMergeMtx.Lock()
+	defer detSourceMergeMtx.Unlock()
+	var cur string
+	err = store.db.QueryRow("SELECT COALESCE(det_source,'') FROM detections WHERE id=?", id).Scan(&cur)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var merged = mergeDetSourceList(cur, src)
+	if merged == cur {
+		return true, nil
+	}
+	_, err = store.db.Exec("UPDATE detections SET det_source=? WHERE id=?", merged, id)
+	return true, err
+}
+
 func dbSetLocked(store *DB, id string, locked bool) error {
 	var v = 0
 	if locked {
@@ -381,7 +451,7 @@ func dbSetLocked(store *DB, id string, locked bool) error {
 
 // getDetection returns one detection by id, or nil.
 func getDetection(store *DB, id string) (*Detection, error) {
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections WHERE id=?"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections WHERE id=?"
 	var rs, e = store.db.Query(q, id)
 	if e != nil {
 		return nil, e
@@ -402,7 +472,8 @@ func getDetection(store *DB, id string) (*Detection, error) {
 		var vat sql.NullInt64
 		var bbox sql.NullString
 		var dtypes sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
+		var dsource sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -428,6 +499,9 @@ func getDetection(store *DB, id string) (*Detection, error) {
 		if dtypes.Valid {
 			d.detTypes = dtypes.String
 		}
+		if dsource.Valid {
+			d.detSource = dsource.String
+		}
 		out = &d
 	}
 	rs.Close()
@@ -441,7 +515,7 @@ func getDetection(store *DB, id string) (*Detection, error) {
 // operations like delete-all that must not silently skip old rows.
 func listAllDetections(store *DB) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections ORDER BY started_at DESC"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections ORDER BY started_at DESC"
 	var rs, e = store.db.Query(q)
 	if e != nil {
 		return nil, e
@@ -462,7 +536,8 @@ func listAllDetections(store *DB) ([]Detection, error) {
 		var vat sql.NullInt64
 		var bbox sql.NullString
 		var dtypes sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
+		var dsource sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
 			return nil, serr
 		}
 		if extra.Valid {
@@ -486,6 +561,9 @@ func listAllDetections(store *DB) ([]Detection, error) {
 		}
 		if dtypes.Valid {
 			d.detTypes = dtypes.String
+		}
+		if dsource.Valid {
+			d.detSource = dsource.String
 		}
 		out = append(out, d)
 	}
@@ -557,7 +635,7 @@ func likeEscape(s string) string {
 // the first page stay reachable; countDetectionsFiltered returns the total.
 func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtype string, label string, hasVision bool, limit int, offset int) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types FROM detections"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections"
 	var cond []string
 	if from > 0 {
 		cond = append(cond, "started_at >= ?")
@@ -627,7 +705,8 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		var vat sql.NullInt64
 		var bbox sql.NullString
 		var dtypes sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes); serr != nil {
+		var dsource sql.NullString
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -652,6 +731,9 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		}
 		if dtypes.Valid {
 			d.detTypes = dtypes.String
+		}
+		if dsource.Valid {
+			d.detSource = dsource.String
 		}
 		out = append(out, d)
 	}
@@ -912,6 +994,10 @@ type Detection struct {
 	// (JSON array of {type,x1,y1,x2,y2,score?}), normalized 0..1. Empty for
 	// ONVIF-only detections.
 	bboxJSON string
+	// detSource lists the detection sources that fed this group
+	// ("onvif", "rtsp", "manual", "test"), comma-separated in first-seen
+	// order. Empty on rows created before the column existed.
+	detSource string
 }
 
 // fileSize returns the size of path or 0 when missing.
