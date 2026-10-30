@@ -19,6 +19,10 @@ import (
 // has a positive vision result for that exact file. Pure stdlib (no font
 // dependency): rectangles + a tiny embedded 5x7 bitmap font for labels.
 
+// maxAnnotatePixels rejects absurd source frames before allocating a full
+// RGBA buffer (12 MP covers 4K with margin; 2 concurrent renders stay ~100 MB).
+const maxAnnotatePixels = 12_000_000
+
 // visionPalette holds distinct box colors; picked by label hash.
 var visionPalette = []color.RGBA{
 	{0x4C, 0xAF, 0x50, 0xFF}, // green
@@ -187,6 +191,12 @@ func parseVisionDets(raw string) []visionDetection {
 // drawVisionBoxes returns a JPEG with YOLO boxes + labels burned in.
 // Input may be JPEG or PNG; output is always JPEG (quality 88).
 func drawVisionBoxes(imgBytes []byte, dets []visionDetection) ([]byte, error) {
+	return drawVisionBoxesMax(imgBytes, dets, 0)
+}
+
+// drawVisionBoxesMax is drawVisionBoxes with an optional long-edge cap
+// (0 = original size). The cap keeps grid thumbnails small enough to cache.
+func drawVisionBoxesMax(imgBytes []byte, dets []visionDetection, maxPx int) ([]byte, error) {
 	if len(dets) == 0 {
 		return nil, fmt.Errorf("no detections")
 	}
@@ -198,6 +208,9 @@ func drawVisionBoxes(imgBytes []byte, dets []visionDetection) ([]byte, error) {
 	var w, h = b.Dx(), b.Dy()
 	if w <= 0 || h <= 0 {
 		return nil, fmt.Errorf("bad image size")
+	}
+	if int64(w)*int64(h) > maxAnnotatePixels {
+		return nil, fmt.Errorf("image too large to annotate (%dx%d)", w, h)
 	}
 	var rgba = image.NewRGBA(b)
 	draw.Draw(rgba, b, img, b.Min, draw.Src)
@@ -243,6 +256,42 @@ func drawVisionBoxes(imgBytes []byte, dets []visionDetection) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, rgba, &jpeg.Options{Quality: 88}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// encodeRGBAJPEG encodes an annotated frame, optionally downscaling its long
+// edge to maxPx first. Grid thumbnails ask for a small copy so the cache and
+// browser memory stay bounded even for 4K snapshots.
+func encodeRGBAJPEG(img *image.RGBA, maxPx int) ([]byte, error) {
+	if img == nil {
+		return nil, fmt.Errorf("nil image")
+	}
+	var out image.Image = img
+	if maxPx > 0 {
+		var b = img.Bounds()
+		var w, h = b.Dx(), b.Dy()
+		if w > maxPx || h > maxPx {
+			var nw, nh = w, h
+			if w >= h {
+				nw = maxPx
+				nh = (h*maxPx + w/2) / w
+			} else {
+				nh = maxPx
+				nw = (w*maxPx + h/2) / h
+			}
+			if nw < 1 {
+				nw = 1
+			}
+			if nh < 1 {
+				nh = 1
+			}
+			out = boxDownscale(img, b, nw, nh)
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: 88}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

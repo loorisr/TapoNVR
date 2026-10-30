@@ -2215,7 +2215,9 @@ func dbCount(db *DB, q string, args ...any) int64 {
 }
 
 // mediaStatsCache bounds how often the recordings tree is walked: the walk is
-// O(files) and the Status tab polls every few seconds.
+// O(files) and the Status tab polls every few seconds. A 30s TTL keeps a large
+// archive from being re-scanned constantly (disk reads) while still refreshing
+// the status card on a sane cadence.
 var mediaStatsMtx sync.Mutex
 var mediaStatsCache = map[string]struct {
 	bytes, jpgs, mp4s int64
@@ -2224,7 +2226,7 @@ var mediaStatsCache = map[string]struct {
 
 func walkMediaStatsCached(root string) (int64, int64, int64) {
 	mediaStatsMtx.Lock()
-	if r, ok := mediaStatsCache[root]; ok && time.Since(r.at) < 5*time.Second {
+	if r, ok := mediaStatsCache[root]; ok && time.Since(r.at) < 30*time.Second {
 		mediaStatsMtx.Unlock()
 		return r.bytes, r.jpgs, r.mp4s
 	}
@@ -2607,6 +2609,76 @@ func handleDetectionMedia(app *App, w http.ResponseWriter, r *http.Request, path
 	writeJSON(w, 404, "{\"error\":\"not found\"}")
 }
 
+// boxRenderMax parses the optional ?max= long-edge limit for annotated
+// snapshots. 0 means the original size; out-of-range values are clamped so a
+// client cannot ask the server to build an enormous intermediate image.
+func boxRenderMax(r *http.Request) int {
+	if r == nil {
+		return 0
+	}
+	var raw = strings.TrimSpace(r.URL.Query().Get("max"))
+	if raw == "" {
+		return 0
+	}
+	var n, err = strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n < 64 {
+		n = 64
+	}
+	if n > 3840 {
+		n = 3840
+	}
+	return n
+}
+
+// smallETag builds a short deterministic ETag from the parts that affect a
+// rendered snapshot (path, mtime, boxes/vision timestamp, size). It lets the
+// browser revalidate cheaply while still changing when the boxes change.
+func smallETag(parts ...string) string {
+	var h uint64 = 1469598103934665603
+	for _, p := range parts {
+		for i := 0; i < len(p); i++ {
+			h ^= uint64(p[i])
+			h *= 1099511628211
+		}
+		h ^= 0xff
+		h *= 1099511628211
+	}
+	return `"` + strconv.FormatUint(h, 16) + `"`
+}
+
+// serveNotModified answers a conditional GET before any expensive decode/draw
+// work. http.ServeContent would do this too, but only after the annotated JPEG
+// has already been rebuilt; on a 500-thumbnail page that is the difference
+// between a cheap 304 and a decode storm. mt may be zero to validate only via
+// the ETag (used when the boxes can change without the file mtime changing).
+func serveNotModified(w http.ResponseWriter, r *http.Request, mt time.Time, etag string) bool {
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			for _, v := range strings.Split(inm, ",") {
+				if strings.TrimSpace(v) == etag {
+					w.WriteHeader(http.StatusNotModified)
+					return true
+				}
+			}
+		}
+	}
+	if mt.IsZero() {
+		return false
+	}
+	mt = mt.Truncate(time.Second)
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		if t, err := http.ParseTime(ims); err == nil && !mt.After(t) {
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+	}
+	return false
+}
+
 // serveVisionBoxes serves the snapshot file with YOLO boxes burned in.
 // Returns false when no boxes apply (caller falls back to the plain file).
 func serveVisionBoxes(app *App, w http.ResponseWriter, r *http.Request, rec *Detection, f string) bool {
@@ -2626,7 +2698,13 @@ func serveVisionBoxes(app *App, w http.ResponseWriter, r *http.Request, rec *Det
 	if vat := time.Unix(vr.at, 0); vat.After(mt) {
 		mt = vat
 	}
-	cacheKey := f + "|" + mt.UTC().Format("20060102T150405") + "|" + strconv.FormatInt(vr.at, 10)
+	w.Header().Set("Cache-Control", "private, max-age=30")
+	var maxPx = boxRenderMax(r)
+	var etag = smallETag(f, mt.UTC().Format("20060102T150405"), strconv.FormatInt(vr.at, 10), strconv.Itoa(maxPx))
+	if serveNotModified(w, r, mt, etag) {
+		return true
+	}
+	cacheKey := f + "|" + mt.UTC().Format("20060102T150405") + "|" + strconv.FormatInt(vr.at, 10) + "|max=" + strconv.Itoa(maxPx)
 	if cached, ok := boxesCacheGet(cacheKey); ok && len(cached) > 0 {
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Header().Set("X-Vision-Boxes", strconv.Itoa(len(dets)))
@@ -2634,11 +2712,14 @@ func serveVisionBoxes(app *App, w http.ResponseWriter, r *http.Request, rec *Det
 		http.ServeContent(w, r, "snapshot-boxes.jpg", mt, bytes.NewReader(cached))
 		return true
 	}
+	boxesRenderAcquire()
 	raw, rerr := os.ReadFile(f)
 	if rerr != nil || len(raw) == 0 {
+		boxesRenderRelease()
 		return false
 	}
-	out, derr := drawVisionBoxes(raw, dets)
+	out, derr := drawVisionBoxesMax(raw, dets, maxPx)
+	boxesRenderRelease()
 	if derr != nil {
 		return false
 	}

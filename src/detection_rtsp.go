@@ -7,7 +7,6 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
-	"image/jpeg"
 	"math"
 	"net/http"
 	"os"
@@ -894,23 +893,49 @@ func serveRTSPBoxes(w http.ResponseWriter, r *http.Request, rec *Detection, f st
 	if len(boxes) == 0 {
 		return false
 	}
+	var mt = recModTime(f)
+	var maxPx = boxRenderMax(r)
+	var etag = smallETag(f, mt.UTC().Format("20060102T150405"), rec.bboxJSON, strconv.Itoa(maxPx))
+	w.Header().Set("Cache-Control", "private, max-age=30")
+	if serveNotModified(w, r, time.Time{}, etag) {
+		return true
+	}
+	cacheKey := f + "|" + mt.UTC().Format("20060102T150405") + "|rtsp|max=" + strconv.Itoa(maxPx) + "|" + rec.bboxJSON
+	if cached, ok := boxesCacheGet(cacheKey); ok && len(cached) > 0 {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("X-RTSP-Boxes", strconv.Itoa(len(boxes)))
+		w.Header().Set("X-Boxes-Cache", "hit")
+		http.ServeContent(w, r, "snapshot-rtsp-boxes.jpg", time.Time{}, bytes.NewReader(cached))
+		return true
+	}
+	boxesRenderAcquire()
 	raw, err := os.ReadFile(f)
 	if err != nil || len(raw) == 0 {
+		boxesRenderRelease()
 		return false
 	}
-	out, derr := drawDetectionBoxes(raw, boxes)
+	out, derr := drawDetectionBoxesMax(raw, boxes, maxPx)
+	boxesRenderRelease()
 	if derr != nil {
 		return false
 	}
+	boxesCacheSet(cacheKey, out)
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("X-RTSP-Boxes", strconv.Itoa(len(boxes)))
-	http.ServeContent(w, r, "snapshot-rtsp-boxes.jpg", recModTime(f), bytes.NewReader(out))
+	w.Header().Set("X-Boxes-Cache", "miss")
+	http.ServeContent(w, r, "snapshot-rtsp-boxes.jpg", time.Time{}, bytes.NewReader(out))
 	return true
 }
 
 // drawDetectionBoxes returns a JPEG with the RTSP boxes + type labels burned in
 // (no confidence: marker boxes carry none). Input JPEG/PNG, output JPEG.
 func drawDetectionBoxes(imgBytes []byte, boxes []detBox) ([]byte, error) {
+	return drawDetectionBoxesMax(imgBytes, boxes, 0)
+}
+
+// drawDetectionBoxesMax is drawDetectionBoxes with an optional long-edge cap
+// (0 = original size). The cap keeps thumbnail renders small enough to cache.
+func drawDetectionBoxesMax(imgBytes []byte, boxes []detBox, maxPx int) ([]byte, error) {
 	if len(boxes) == 0 {
 		return nil, fmt.Errorf("no boxes")
 	}
@@ -922,6 +947,9 @@ func drawDetectionBoxes(imgBytes []byte, boxes []detBox) ([]byte, error) {
 	var w, h = b.Dx(), b.Dy()
 	if w <= 0 || h <= 0 {
 		return nil, fmt.Errorf("bad image size")
+	}
+	if int64(w)*int64(h) > maxAnnotatePixels {
+		return nil, fmt.Errorf("image too large to annotate (%dx%d)", w, h)
 	}
 	var rgba = image.NewRGBA(b)
 	draw.Draw(rgba, b, img, b.Min, draw.Src)
@@ -979,9 +1007,5 @@ func drawDetectionBoxes(imgBytes []byte, boxes []detBox) ([]byte, error) {
 		fillRect(rgba, x1, ty, x1+tw, ty+th, c)
 		drawVisionText(rgba, x1+scale, ty+scale, scale, label, white)
 	}
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, rgba, &jpeg.Options{Quality: 88}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return encodeRGBAJPEG(rgba, maxPx)
 }

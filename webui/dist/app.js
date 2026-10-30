@@ -266,11 +266,15 @@ function bboxBadgeText(d){
 // annotatedURL returns the snapshot URL with boxes burned in (server-side
 // ?boxes=1) when this detection has a positive YOLO result or camera-side RTSP
 // SEI boxes. The server serves the plain JPEG when neither applies.
-function visionBoxesURL(d, u){
+function visionBoxesURL(d, u, maxPx){
   if(!u) return u;
   var hasVision = d && d.vision && d.vision.count>0;
   var hasRTSP = d && d.bbox && d.bbox.length>0;
-  if(hasVision || hasRTSP) return u+(u.indexOf("?")>=0?"&":"?")+"boxes=1";
+  if(hasVision || hasRTSP){
+    var q = (u.indexOf("?")>=0?"&":"?")+"boxes=1";
+    if(maxPx) q += "&max="+encodeURIComponent(maxPx);
+    return u+q;
+  }
   return u;
 }
 function refreshVisionDetail(d){
@@ -935,6 +939,7 @@ function switchRecView(v){
   document.querySelectorAll('#rectabs .tab').forEach(function(b){ b.classList.toggle('active', b.dataset.view===v); });
   document.getElementById('dlist').hidden = v!=='table';
   document.getElementById('recGrid').hidden = v!=='grid';
+  if(v==='grid') renderRecordingsGrid(_lastRecList);
 }
 document.querySelectorAll('#rectabs .tab').forEach(function(b){ b.onclick = function(){ switchRecView(b.dataset.view); }; });
 
@@ -1267,7 +1272,11 @@ function renderRecordingsGrid(list){
   var box=document.getElementById("recGrid");
   if(!box) return;
   box.innerHTML="";
-  if(recView==='grid'){ box.appendChild(buildRecFilterBar(true)); }
+  // Only build cards (and their <img> elements) when the grid is visible:
+  // rendering 500 hidden thumbnails on every refresh caused a snapshot/disk
+  // and box-render storm just by opening the web page.
+  if(recView!=='grid') return;
+  box.appendChild(buildRecFilterBar(true));
   if(list.length===0){
     // Append, don't reset innerHTML: that would wipe the filter bar rendered
     // just above and leave the user unable to clear a filter that matched
@@ -1283,7 +1292,7 @@ function renderRecordingsGrid(list){
     var card=document.createElement("div"); card.className="rec-card";
     var thumb=document.createElement("div"); thumb.className="rec-thumb"; thumb.onclick=function(){ showDetail(d,'snapshots'); };
     var img;
-    if (d.snapshot) { img=document.createElement("img"); _imgFallback(img, "snapshot manquant"); img.src=visionBoxesURL(d, d.snapshot); img.alt="snapshot"; img.loading="lazy"; }
+    if (d.snapshot) { img=document.createElement("img"); _imgFallback(img, "snapshot manquant"); img.src=visionBoxesURL(d, d.snapshot, 480); img.alt="snapshot"; img.loading="lazy"; }
     else { img=document.createElement("div"); img.className="meta"; img.style.cssText="display:flex;align-items:center;justify-content:center;height:100%;min-height:120px"; img.textContent="no snapshot"; }
     var badge=document.createElement("span"); badge.className="rec-badge"; badge.style.cssText="display:inline-flex;flex-wrap:wrap;gap:4px;max-width:calc(100% - 16px)";
     sortDetectionTypes(detectionTypeList(d)).forEach(function(t){ var b=document.createElement("span"); b.className="badge"; b.textContent=detectionLabel(t); badge.appendChild(b); });
@@ -1732,6 +1741,7 @@ function renderDetailTab() {
       _imgFallback(img, "snapshot manquant");
       img.src = src;
       img.alt = "snapshot";
+      img.loading = "lazy";
       img.style.cursor = "zoom-in";
       img.onclick = function () { showLightbox(src); };
       snaps.appendChild(img);
@@ -1821,8 +1831,11 @@ function load() {
   refreshToggles();
   api("/api/cameras").then(renderCameras).catch(function () {});
   refreshFilterCams();
-  refreshRecordings();
-  refreshEvents();
+  // Only load the visible tab. The old unconditional calls fetched 500
+  // detections + 1000 raw events and built hidden grid thumbnails on every
+  // page open, which could pin CPU/disk/RAM before the user clicked anything.
+  if (activeTab === "recordings") refreshRecordings();
+  else if (activeTab === "events") refreshEvents();
 }
 
 // Refresh only the visible tab, and never while the tab is hidden or while
@@ -1848,7 +1861,9 @@ function initEvents() {
     // vision analysis landed after the fact: refresh badges/boxes (debounced,
     // bursts analyze several snapshots within seconds).
     if (d.kind === "vision") {
-      if (!_visionRefreshT) _visionRefreshT = setTimeout(function () { _visionRefreshT = null; refreshRecordings(); }, 2000);
+      if (_visionRefreshT) return;
+      if (activeTab !== "recordings") return;
+      _visionRefreshT = setTimeout(function () { _visionRefreshT = null; refreshRecordings(); }, 2000);
       return;
     }
     // Live SEI boxes: draw them over the video of the reporting camera.
