@@ -133,6 +133,7 @@ func run(args []string) int {
 	startStream(&app)
 	buffersStart(&app)
 	onvifEventsStart(&app)
+	snapshotWarmupStart(&app)
 	detectionRTSPStart(&app)
 	initMqtt(&app)
 	handleSignals()

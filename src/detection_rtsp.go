@@ -370,6 +370,11 @@ type rtspDetector struct {
 	// callers filter by detection type.
 	lastBoxes   []detBox
 	lastBoxesAt time.Time
+	// boxHist keeps the last few seconds of SEI samples. A rolling-buffer
+	// snapshot is the last IDR and can be one GOP older than the live frame;
+	// seiBoxesAt uses this history to pair it with the boxes that were on
+	// screen when that image was actually taken.
+	boxHist []seiBoxSample
 	// liveAt throttles the SSE "boxes" events feeding the live overlay:
 	// SEI markers can arrive on every frame, but ~5 updates/s is plenty to
 	// draw boxes without flooding the browser.
@@ -379,6 +384,41 @@ type rtspDetector struct {
 // liveBoxInterval is the minimum delay between two live-overlay box broadcasts
 // for one camera (5 updates/s).
 const liveBoxInterval = 200 * time.Millisecond
+
+// SEI box history bounds: long enough to cover a typical GOP plus network
+// jitter, capped so a high-frame-rate stream cannot grow it without bound.
+const (
+	seiBoxHistoryTTL = 30 * time.Second
+	seiBoxHistoryMax = 2048
+)
+
+type seiBoxSample struct {
+	at    time.Time
+	boxes []detBox
+}
+
+// pushBoxHistoryLocked appends one SEI sample and prunes expired/excess
+// entries. boxes must be an immutable copy owned by the detector (onBoxes
+// passes d.lastBoxes), so no second copy is made per frame. Caller holds d.mu.
+func (d *rtspDetector) pushBoxHistoryLocked(boxes []detBox, now time.Time) {
+	d.boxHist = append(d.boxHist, seiBoxSample{at: now, boxes: boxes})
+	var drop int
+	for drop < len(d.boxHist) && now.Sub(d.boxHist[drop].at) > seiBoxHistoryTTL {
+		d.boxHist[drop] = seiBoxSample{}
+		drop++
+	}
+	if drop > 0 {
+		copy(d.boxHist, d.boxHist[drop:])
+		d.boxHist = d.boxHist[:len(d.boxHist)-drop]
+	}
+	if extra := len(d.boxHist) - seiBoxHistoryMax; extra > 0 {
+		for i := 0; i < extra; i++ {
+			d.boxHist[i] = seiBoxSample{}
+		}
+		copy(d.boxHist, d.boxHist[extra:])
+		d.boxHist = d.boxHist[:seiBoxHistoryMax]
+	}
+}
 
 // rtspDetMtx guards rtspDetectors: the running detector per camera, so the
 // snapshot pipeline can read the current SEI boxes.
@@ -421,6 +461,43 @@ func latestSEIBoxes(camID string, maxAge time.Duration) ([]detBox, time.Time, bo
 		return nil, d.lastBoxesAt, false
 	}
 	return append([]detBox(nil), d.lastBoxes...), d.lastBoxesAt, true
+}
+
+// seiBoxesAt returns the SEI sample closest to at within tolerance. Unlike
+// latestSEIBoxes it can pair a rolling-buffer frame, whose image time is one
+// GOP behind the live stream, with the boxes that were on screen at capture.
+// ok is false with no detector/history or when the closest sample is too far.
+func seiBoxesAt(camID string, at time.Time, tolerance time.Duration) ([]detBox, time.Time, bool) {
+	if at.IsZero() {
+		return nil, time.Time{}, false
+	}
+	rtspDetMtx.Lock()
+	var d = rtspDetectors[camID]
+	rtspDetMtx.Unlock()
+	if d == nil {
+		return nil, time.Time{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var best seiBoxSample
+	var bestDelta time.Duration
+	var found bool
+	for _, s := range d.boxHist {
+		var delta = s.at.Sub(at)
+		if delta < 0 {
+			delta = -delta
+		}
+		if !found || delta < bestDelta {
+			best, bestDelta, found = s, delta, true
+		}
+	}
+	if !found || len(best.boxes) == 0 {
+		return nil, time.Time{}, false
+	}
+	if tolerance > 0 && bestDelta > tolerance {
+		return nil, best.at, false
+	}
+	return append([]detBox(nil), best.boxes...), best.at, true
 }
 
 // streamSrc resolves the stream URL to read at this moment: the go2rtc relay
@@ -560,6 +637,9 @@ func (d *rtspDetector) onBoxes(boxes []detBox) {
 	// they need and the live overlay already reports everything.
 	d.lastBoxes = append([]detBox(nil), boxes...)
 	d.lastBoxesAt = now
+	if len(d.lastBoxes) > 0 {
+		d.pushBoxHistoryLocked(d.lastBoxes, now)
+	}
 	for _, b := range boxes {
 		if !d.types[b.Type] {
 			continue

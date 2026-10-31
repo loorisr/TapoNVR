@@ -186,25 +186,42 @@ Detection source: RTSP
 Identification: camera=person,motion | YOLO=person 86% (3 boxes)
 ```
 
-In `best` mode the capture chain prefers the camera's **native snapshot** over
-the rolling-buffer IDR. The buffer only holds the last IDR, which can precede
-the SEI event by one GOP (often 1–2 s), so the subject may not be where the box
-says. A buffer frame is therefore **never** paired with live SEI boxes: boxes
-are only used with fresh sources, and a stale buffer IDR is retried against a
-live source first. Boxes are also dropped when the image and the box sample are
-more than ~1.5 s apart.
+All snapshot modes are **buffer-first**: when `record.mode: buffer` has a
+decodable frame, it is used immediately. The ring frame is the event image
+(within one GOP, logged as `image_age_ms`) and never waits for the live chain;
+a buffer frame is static and cannot be several seconds late like a fallback
+capture. This keeps the primary snapshot, the detection row and the alert at
+the event time instead of 30–40 s later.
 
-Without usable boxes (ONVIF-only source, no fresh source, or no box in any
+`best` mode may spend one short attempt (≤1.5 s) on the camera's **native
+snapshot** when the buffer IDR is older than 1.5 s, so the attached frame can
+match the live SEI boxes; if that fails, the buffer frame is kept. Extras are
+always buffer-first so the whole burst stays within `best_max_wait_s`.
+
+SEI boxes for buffer frames come from a short per-camera box history at the
+image timestamp (`seiBoxesAt`), never from the current live frame. A buffer
+frame can therefore be paired with the boxes that were actually on screen when
+that image was taken. Boxes are dropped when the closest sample is more than
+~1.5 s away; live sources still use the latest boxes.
+
+When the ring has no decodable frame (cold start, recorder down, legacy
+`record.mode: event`), the live fallback is bounded by a global 4 s budget:
+cached ONVIF snapshot URI first, then RTSP, then HTTP probes. The total never
+exceeds the budget, and the detection is recorded even when every source fails.
+The ONVIF snapshot URI is resolved in the background at startup, so discovery
+is never on the detection hot path.
+
+Without usable boxes (ONVIF-only source, no history, or no box in any
 candidate) the sharpest non-placeholder frame wins, then the primary. `primary`
 (the code default for existing configs) keeps the immediate trigger-frame
-behavior and the buffer-first capture order.
+behavior.
 
 Buffer frames are timestamped from the segment's mtime minus the IDR age inside
 the segment, so `image_age_ms` in the logs is real wall-clock age. The
-`snapshot boxes paired` (capture) and `pushover message sent` (`picked_source`,
-`picked_age_ms`, `picked_boxes`) logs make any remaining offset easy to check.
-Only the attached copy is affected: stored snapshots, S3 uploads and the primary
-shown in the UI are unchanged.
+`snapshot buffer used` / `snapshot boxes paired` (capture) and `pushover message
+sent` (`picked_source`, `picked_age_ms`, `picked_boxes`) logs make any remaining
+offset easy to check. Only the attached copy is affected by `best` selection:
+stored snapshots, S3 uploads and the primary shown in the UI are unchanged.
 
 ### Camera
 

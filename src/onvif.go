@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -186,6 +187,19 @@ func onvifGet(cam *CameraCfg) *onvifDevice {
 		dev.nextRetry = time.Now().Add(5 * time.Second)
 	}
 	dev.mu.Unlock()
+	return dev
+}
+
+// onvifGetCached returns the cached device handle without triggering discovery.
+// Snapshot capture uses this: a detection hot path must never block on a SOAP
+// probe, and an undiscovered device simply falls through to the other sources.
+func onvifGetCached(cam *CameraCfg) *onvifDevice {
+	if cam == nil {
+		return nil
+	}
+	onvifDevices.Lock()
+	dev := onvifDevices.m[onvifDeviceKey(cam)]
+	onvifDevices.Unlock()
 	return dev
 }
 
@@ -414,9 +428,14 @@ func sha256Hex(s string) string {
 
 // httpGetDigest performs a GET with HTTP Digest auth (MD5/qop=auth).
 func httpGetDigest(uri, user, pass string, timeout time.Duration) ([]byte, string, error) {
+	// One context for the whole digest flow (challenge + authenticated GET):
+	// the snapshot chain passes a remaining-time budget and must not spend it
+	// twice when both requests are slow.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	client := &http.Client{Timeout: timeout}
 	// first request to get 401 + nonce
-	req, rerr := http.NewRequest("GET", uri, nil)
+	req, rerr := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if rerr != nil {
 		return nil, "", rerr
 	}
@@ -506,7 +525,7 @@ func httpGetDigest(uri, user, pass string, timeout time.Duration) ([]byte, strin
 	if algo != "" {
 		authHeader += fmt.Sprintf(`, algorithm=%s`, algo)
 	}
-	req2, rerr2 := http.NewRequest("GET", uri, nil)
+	req2, rerr2 := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if rerr2 != nil {
 		return nil, "", rerr2
 	}
