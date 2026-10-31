@@ -300,6 +300,25 @@ func cameraBuffer(camID string) *CameraBuffer {
 	return b
 }
 
+// pin keeps the ring from pruning below pinKeep. clip assembly pins for its
+// whole run, and collectDetection pins as soon as an event is accepted: the
+// snapshot chain can fall back to native/RTSP sources and take several
+// seconds, and without this early pin the watcher would prune the segments
+// covering the event before assembleClip ever sees them.
+func (b *CameraBuffer) pin() {
+	b.mu.Lock()
+	b.pins++
+	b.mu.Unlock()
+}
+
+func (b *CameraBuffer) unpin() {
+	b.mu.Lock()
+	if b.pins > 0 {
+		b.pins--
+	}
+	b.mu.Unlock()
+}
+
 // bufferBaseDir resolves where the rolling buffer lives. When record.buffer_dir is
 // set it is used verbatim; otherwise we prefer a RAM-backed tmpfs so the
 // continuously-recycled segments never write to durable flash.
@@ -780,12 +799,14 @@ func clipStats() (queue, running, dropped int64) {
 
 // clipAssembleAsync runs assembleClip under the bounded pool: fast path takes
 // a slot immediately; overflow waits for a slot while pending <= 16, and is
-// dropped with a WARN beyond that.
-func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, eventT int64) {
+// dropped with a WARN beyond that. pinHeld transfers ownership of the event
+// pin taken by collectDetection to the assembly goroutine (released here if
+// the assembly is dropped, otherwise by assembleClip).
+func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, eventT int64, pinHeld bool) {
 	if clipPoolTryAcquire() {
 		go func() {
 			defer clipPoolRelease()
-			assembleClip(app, b, detID, out, eventT)
+			assembleClip(app, b, detID, out, eventT, pinHeld)
 		}()
 		return
 	}
@@ -793,6 +814,9 @@ func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, even
 	if pending > clipMaxPending {
 		atomic.AddInt64(&clipQueueDepth, -1)
 		atomic.AddInt64(&clipDropped, 1)
+		if pinHeld {
+			b.unpin()
+		}
 		logIt(LWARN, "clip assembly dropped (pool saturated)", map[string]string{"id": detID, "pending": strconv.FormatInt(pending, 10)})
 		return
 	}
@@ -802,7 +826,7 @@ func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, even
 		atomic.AddInt64(&clipQueueDepth, -1)
 		atomic.AddInt64(&clipRunning, 1)
 		defer clipPoolRelease()
-		assembleClip(app, b, detID, out, eventT)
+		assembleClip(app, b, detID, out, eventT, pinHeld)
 	}()
 }
 
@@ -810,7 +834,7 @@ func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, even
 // time so the pre-roll is measured against the true event, not assembly time.
 // While the camera reports the detection as active, the post-detection timer
 // does not start - it begins only once the camera sends an inactive event.
-func assembleClip(app *App, b *CameraBuffer, detID string, out string, eventT int64) {
+func assembleClip(app *App, b *CameraBuffer, detID string, out string, eventT int64, pinHeld bool) {
 	markClipPending(detID)
 	defer unmarkClipPending(detID)
 	var preSec = int64(app.cfg.Record.PreDetection)
@@ -818,14 +842,13 @@ func assembleClip(app *App, b *CameraBuffer, detID string, out string, eventT in
 	var preStart = eventT - preSec
 	var segSec = int64(b.segSec)
 
-	b.mu.Lock()
-	b.pins++
-	b.mu.Unlock()
-	defer func() {
-		b.mu.Lock()
-		b.pins--
-		b.mu.Unlock()
-	}()
+	// pinHeld means collectDetection already pinned the ring before capturing
+	// snapshots, so the event window survived that delay; take ownership of it.
+	// Otherwise (legacy callers) pin now for the duration of the assembly.
+	if !pinHeld {
+		b.pin()
+	}
+	defer b.unpin()
 
 	// If the camera is still reporting the detection as active, defer the
 	// post-detection countdown until it becomes inactive.
@@ -928,7 +951,39 @@ func assembleClip(app *App, b *CameraBuffer, detID string, out string, eventT in
 	}
 	b.mu.Unlock()
 	if len(chosen) == 0 {
-		return
+		// The requested window is no longer in the ring: the recorder or
+		// go2rtc was reconnecting, or (on older builds) assembly started after
+		// the window had been pruned. Keep the retained segments so the
+		// detection still gets playable footage instead of quietly ending up
+		// with an empty clip_path and a dead "Video" button.
+		b.mu.Lock()
+		var avail = append([]BuffSeg(nil), b.segs...)
+		b.mu.Unlock()
+		logIt(LWARN, "clip window missing from buffer, using retained segments", map[string]string{
+			"id": detID, "camera": b.camID,
+			"window_start": strconv.FormatInt(preStart, 10),
+			"window_end":   strconv.FormatInt(afterStop, 10),
+			"segments":     strconv.Itoa(len(avail)),
+		})
+		if len(avail) == 0 {
+			logIt(LWARN, "clip skipped: recording buffer empty", map[string]string{"id": detID, "camera": b.camID})
+			return
+		}
+		// Bound the fallback so a long pinKeep ring cannot turn one missing
+		// window into a multi-minute clip.
+		var maxSegs int
+		if segSec > 0 {
+			maxSegs = int((preSec+afterSec+30)/segSec) + 2
+		}
+		if maxSegs < 4 {
+			maxSegs = 4
+		}
+		if len(avail) > maxSegs {
+			avail = avail[len(avail)-maxSegs:]
+		}
+		for _, s := range avail {
+			chosen = append(chosen, s.path)
+		}
 	}
 	// Try to transmux TS segments to MP4 (browser playable), fallback to TS concat.
 	// The TS fallback keeps the real .ts extension so the file is served as
@@ -1503,16 +1558,12 @@ func grabSnapshotFromBuffer(app *App, camID string, dest string) (bool, time.Tim
 	}
 	b := cameraBuffer(camID)
 	// Pin the ring so the watcher does not prune segments while we read.
+	b.pin()
 	b.mu.Lock()
-	b.pins++
 	segs := make([]BuffSeg, len(b.segs))
 	copy(segs, b.segs)
 	b.mu.Unlock()
-	defer func() {
-		b.mu.Lock()
-		b.pins--
-		b.mu.Unlock()
-	}()
+	defer b.unpin()
 	if len(segs) == 0 {
 		return false, time.Time{}
 	}
@@ -2141,6 +2192,23 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	// Separate switches so recording (clips) and snapshots can be enabled on their own.
 	var snapOn = snapshotsEnabled()
 	var recordOn = recordingEnabled()
+	// Pin the rolling buffer as soon as the event is accepted, before the
+	// snapshot chain runs. A buffer IDR older than 1.5 s falls back to native
+	// ONVIF/RTSP snapshots and can take many seconds; without this early pin
+	// the watcher prunes the event window (pre_detection is short) before
+	// assembleClip is even started, and the detection ends up with no clip.
+	var clipBuf *CameraBuffer
+	var clipPinned bool
+	if src != "" && recordOn && app.cfg.Record.Mode == "buffer" {
+		clipBuf = cameraBuffer(camID)
+		clipBuf.pin()
+		clipPinned = true
+		defer func() {
+			if clipPinned {
+				clipBuf.unpin()
+			}
+		}()
+	}
 	var count = app.cfg.Record.Snapshots.Count
 	// count < 0 means continuous: keep shooting at interval_s while the
 	// camera reports the detection as active (bounded, see burst caps).
@@ -2402,13 +2470,14 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	if snapPath != "" {
 		queueVisionForDetection(app, id, snapPath)
 	}
-	if src != "" && recordOn && app.cfg.Record.Mode == "buffer" {
+	if clipBuf != nil {
 		// Slot already reserved + confirmed above; re-confirm to fold in any
 		// extension that landed during the S3/notify calls, then assemble.
+		// The event pin taken before snapshot capture is transferred to the
+		// assembly goroutine (it releases it when the clip is done or dropped).
 		confirmActiveRec(camID, id, d.endedAt)
-		var b = cameraBuffer(camID)
-		// Assemble the (pre-event + after) clip in parallel with snapshots.
-		clipAssembleAsync(app, b, id, clip, now)
+		clipAssembleAsync(app, clipBuf, id, clip, now, clipPinned)
+		clipPinned = false
 	}
 	return &d, nil
 }
