@@ -84,6 +84,7 @@ storage:
   enabled: false
   # Disk guard (0 = off): when data_dir's filesystem breaches either
   # threshold, oldest unlocked detections are pruned until back under.
+  # Checked at boot, then hourly.
   # max_disk_pct: 90
   # min_free_gb: 1
   s3:

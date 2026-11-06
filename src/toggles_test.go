@@ -424,7 +424,7 @@ func TestPruneReadsNullExtras(t *testing.T) {
 		"pb", "cam0", "c", "motion", 0.9, 1, 2, "s2.jpg", "c2.mp4", "e1.jpg,e2.jpg", 0); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := listOldDetections(store, 999)
+	rows, err := listOldDetections(store, 999, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -130,6 +130,12 @@ func openDB(path string) (*DB, error) {
 	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_detections_started ON detections(started_at)")
 	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_detections_camera ON detections(camera_id, started_at)")
 	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_onvif_events_detection ON onvif_events(detection_id)")
+	// Retention / disk-guard prunes filter on ended_at and created_at: without
+	// these indexes every pass is a full table scan.
+	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_detections_ended ON detections(ended_at)")
+	_, _ = store.db.Exec("CREATE INDEX IF NOT EXISTS idx_onvif_events_created ON onvif_events(created_at)")
+	// Drop label exclusions left behind by deletes from older versions.
+	_, _ = store.db.Exec("DELETE FROM vision_overrides WHERE detection_id NOT IN (SELECT id FROM detections)")
 	backfillDetectionTypes(&store)
 	return &store, nil
 }
@@ -1274,6 +1280,27 @@ func dbGetVisionResult(store *DB, id string, snapPath string) (*VisionSnapResult
 		r.at = vat.Int64
 	}
 	return &r, rs.Err()
+}
+
+// dbDeleteDetectionRows removes one detection and every row hanging off it
+// (per-snapshot YOLO results and manual label exclusions) in one
+// transaction, so neither table accumulates orphans after deletes/prunes.
+func dbDeleteDetectionRows(store *DB, id string) error {
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, q := range []string{
+		"DELETE FROM detections WHERE id=?",
+		"DELETE FROM vision_results WHERE detection_id=?",
+		"DELETE FROM vision_overrides WHERE detection_id=?",
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // dbDeleteVisionResults purges every per-snapshot outcome of a detection.

@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1.6
-FROM golang:1-alpine AS builder
+# Builder runs on the build host's native arch and cross-compiles (pure Go, no
+# CGO): multi-arch images need no QEMU emulation for the slow compile step.
+FROM --platform=$BUILDPLATFORM golang:1-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
 
@@ -14,12 +19,15 @@ COPY src/ ./src/
 # Sources are in ./src (package main)
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/taponvr ./src \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" GOARM="${TARGETVARIANT#v}" \
+    go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/taponvr ./src \
     && chmod +x /out/taponvr \
     && mkdir -p /out/blank-data && chmod 770 /out/blank-data
 
 # ---------- go2rtc fetch stage (isolated so curl doesn't bloat final image) ----------
-FROM alpine:3.24 AS go2rtc-fetch
+# Download only (no target-arch code runs here), so it also uses the native
+# build platform; the target architecture is selected via TARGETARCH below.
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS go2rtc-fetch
 # Pinned by default for reproducible builds; override with
 # --build-arg GO2RTC_VERSION=vX.Y.Z to bump. "latest" is still accepted but
 # non-reproducible and skips verification unless GO2RTC_SHA256 is set.

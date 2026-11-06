@@ -2780,31 +2780,25 @@ func dbAppendSnapPaths(store *DB, id string, paths []string) error {
 
 // ---------------- prune: retention ----------------------------
 
-// pruneDeleteRow deletes one detection + its vision rows in a transaction,
-// logging Exec/Commit failures instead of silently ignoring them.
-func pruneDeleteRow(app *App, id string) {
-	if tx, terr := app.db.db.Begin(); terr == nil {
-		if _, e := tx.Exec("DELETE FROM detections WHERE id=?", id); e != nil {
-			logIt(LERR, "prune delete failed", map[string]string{"id": id, "error": e.Error()})
-		}
-		if _, e := tx.Exec("DELETE FROM vision_results WHERE detection_id=?", id); e != nil {
-			logIt(LERR, "prune delete vision failed", map[string]string{"id": id, "error": e.Error()})
-		}
-		if e := tx.Commit(); e != nil {
-			logIt(LERR, "prune commit failed", map[string]string{"id": id, "error": e.Error()})
-		}
-	} else {
-		logIt(LERR, "prune begin failed", map[string]string{"id": id, "error": terr.Error()})
-		if _, e := app.db.db.Exec("DELETE FROM detections WHERE id=?", id); e != nil {
-			logIt(LERR, "prune delete failed", map[string]string{"id": id, "error": e.Error()})
-		}
-		if e := dbDeleteVisionResults(app.db, id); e != nil {
-			logIt(LERR, "prune delete vision failed", map[string]string{"id": id, "error": e.Error()})
-		}
+// pruneDeleteRow deletes one detection and its vision rows in a single
+// transaction, logging failures instead of silently ignoring them. Returns
+// false when the row could not be deleted: callers then keep its media, or the
+// row would be left pointing at missing files.
+func pruneDeleteRow(app *App, id string) bool {
+	if err := dbDeleteDetectionRows(app.db, id); err != nil {
+		logIt(LERR, "prune delete failed", map[string]string{"id": id, "error": err.Error()})
+		return false
 	}
+	return true
 }
 
+// pruneMtx serializes retention passes: the boot pass, the daily loop and the
+// hourly disk guard must never delete (and walk S3) concurrently.
+var pruneMtx sync.Mutex
+
 func pruneOnce(app *App) {
+	pruneMtx.Lock()
+	defer pruneMtx.Unlock()
 	// retention_days <= 0 means "keep forever": a zero cutoff would match every
 	// row and wipe the archive (plus its S3 objects) at boot and daily.
 	// The disk guard still runs below so "keep everything" cannot fill the
@@ -2820,16 +2814,18 @@ func pruneOnce(app *App) {
 	var cutoff = time.Now().Add(-time.Duration(app.cfg.Server.RetentionDays) * 24 * time.Hour).Unix()
 	// Query old rows directly (not the newest-first listing) so the prune pass is
 	// not capped by the 500-row limit and actually reaches aging detections.
-	var old, err = listOldDetections(app.db, cutoff)
-	if err != nil {
-		return
-	}
 	// Bounded per pass: S3 deletes are sequential with 60s timeouts each, so
 	// an unbounded first pass would stall for hours. The daily loop (and the
-	// next boot pass) continues where this one stopped.
+	// next boot pass) continues where this one stopped. The bound is applied
+	// in SQL so a huge backlog is never loaded into memory at once.
 	const maxPrunePerPass = 500
+	var old, err = listOldDetections(app.db, cutoff, maxPrunePerPass+1)
+	if err != nil {
+		logIt(LERR, "prune query failed", map[string]string{"error": err.Error()})
+		old = nil
+	}
 	if len(old) > maxPrunePerPass {
-		logIt(LWARN, "prune pass capped, remainder continues next pass", map[string]string{"total": strconv.Itoa(len(old)), "capped": strconv.Itoa(maxPrunePerPass)})
+		logIt(LWARN, "prune pass capped, remainder continues next pass", map[string]string{"capped": strconv.Itoa(maxPrunePerPass)})
 		old = old[:maxPrunePerPass]
 	}
 	for i := range old {
@@ -2837,7 +2833,9 @@ func pruneOnce(app *App) {
 		// Delete the DB rows first (detection + vision in one transaction):
 		// a crash then leaves orphan files (reclaimed next pass / visible
 		// on disk) instead of DB rows pointing at missing media.
-		pruneDeleteRow(app, d.id)
+		if !pruneDeleteRow(app, d.id) {
+			continue
+		}
 		deleteDetectionFiles(app, &d)
 	}
 	// prune old raw ONVIF events as well
@@ -2872,7 +2870,7 @@ func pruneByType(app *App) {
 			continue
 		}
 		var cutoff = time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix()
-		cands, err := listOldDetectionsByType(app.db, cutoff, t)
+		cands, err := listOldDetectionsByType(app.db, cutoff, t, maxPerTypePerPass+1)
 		if err != nil || len(cands) == 0 {
 			continue
 		}
@@ -2883,7 +2881,9 @@ func pruneByType(app *App) {
 				break
 			}
 			var d = cands[i]
-			pruneDeleteRow(app, d.id)
+			if !pruneDeleteRow(app, d.id) {
+				continue
+			}
 			deleteDetectionFiles(app, &d)
 			n++
 		}
@@ -2922,12 +2922,12 @@ func diskGuardPrune(app *App) {
 		return
 	}
 	// All ended, oldest first (currently recording rows have future ended_at).
-	cands, err := listOldDetections(app.db, time.Now().Unix()+1)
+	const maxGuardPerPass = 500
+	cands, err := listOldDetections(app.db, time.Now().Unix()+1, maxGuardPerPass)
 	if err != nil || len(cands) == 0 {
 		logIt(LWARN, "disk guard: threshold breached but nothing prunable (all locked/recording?)", nil)
 		return
 	}
-	const maxGuardPerPass = 500
 	var removed int
 	for i := range cands {
 		if i >= maxGuardPerPass {
@@ -2939,7 +2939,9 @@ func diskGuardPrune(app *App) {
 			}
 		}
 		var d = cands[i]
-		pruneDeleteRow(app, d.id)
+		if !pruneDeleteRow(app, d.id) {
+			continue
+		}
 		deleteDetectionFiles(app, &d)
 		removed++
 	}
@@ -2952,23 +2954,41 @@ func diskGuardPrune(app *App) {
 
 // startPruneLoop reruns retention pruning daily (plus the boot pass in main).
 // Without this, retention_days only takes effect on restart and disk grows
-// unbounded between restarts.
+// unbounded between restarts. The disk guard (max_disk_pct / min_free_gb) is
+// an emergency brake, so it is also checked hourly: a busy camera can fill a
+// small disk long before the next daily pass. The same hourly tick retries
+// S3 uploads that failed (network/S3 outage) instead of leaving them pending
+// until someone presses the retry button.
 func startPruneLoop(app *App) {
 	go func() {
-		var t = time.NewTicker(24 * time.Hour)
-		defer t.Stop()
-		for range t.C {
-			pruneOnce(app)
+		var daily = time.NewTicker(24 * time.Hour)
+		defer daily.Stop()
+		var hourly = time.NewTicker(time.Hour)
+		defer hourly.Stop()
+		for {
+			select {
+			case <-daily.C:
+				pruneOnce(app)
+			case <-hourly.C:
+				pruneMtx.Lock()
+				diskGuardPrune(app)
+				pruneMtx.Unlock()
+				s3RetryAuto(app)
+			}
 		}
 	}()
 }
 
 // listOldDetectionsByType is listOldDetections restricted to one detection
 // type (for record.retention_by_type overrides).
-func listOldDetectionsByType(store *DB, cutoff int64, dtype string) ([]Detection, error) {
+// limit <= 0 means no limit.
+func listOldDetectionsByType(store *DB, cutoff int64, dtype string, limit int) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked FROM detections WHERE ended_at < ? AND det_type = ? AND (locked IS NULL OR locked=0) ORDER BY ended_at ASC"
-	var rs, e = store.db.Query(q, cutoff, dtype)
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked FROM detections WHERE ended_at < ? AND det_type = ? AND (locked IS NULL OR locked=0) ORDER BY ended_at ASC LIMIT ?"
+	if limit <= 0 {
+		limit = -1 // SQLite: negative LIMIT = unbounded
+	}
+	var rs, e = store.db.Query(q, cutoff, dtype, limit)
 	if e != nil {
 		return nil, e
 	}
@@ -2994,11 +3014,15 @@ func listOldDetectionsByType(store *DB, cutoff int64, dtype string) ([]Detection
 	return out, nil
 }
 
-// listOldDetections returns rows ended before cutoff, oldest first, excluding locked recordings.
-func listOldDetections(store *DB, cutoff int64) ([]Detection, error) {
+// listOldDetections returns up to limit rows ended before cutoff, oldest
+// first, excluding locked recordings. limit <= 0 means no limit.
+func listOldDetections(store *DB, cutoff int64, limit int) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked FROM detections WHERE ended_at < ? AND (locked IS NULL OR locked=0) ORDER BY ended_at ASC"
-	var rs, e = store.db.Query(q, cutoff)
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked FROM detections WHERE ended_at < ? AND (locked IS NULL OR locked=0) ORDER BY ended_at ASC LIMIT ?"
+	if limit <= 0 {
+		limit = -1 // SQLite: negative LIMIT = unbounded
+	}
+	var rs, e = store.db.Query(q, cutoff, limit)
 	if e != nil {
 		return nil, e
 	}

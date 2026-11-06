@@ -247,17 +247,23 @@ func authRateLimited(ip string) bool {
 
 func authNoteFailure(ip string) {
 	authFailMtx.Lock()
+	defer authFailMtx.Unlock()
+	var now = time.Now()
+	// Drop expired windows so the map cannot grow without bound when many
+	// distinct addresses fail (scanners, IPv6 privacy addresses).
+	if len(authFailMap) > 256 {
+		for k, v := range authFailMap {
+			if now.Sub(v.since) > time.Minute {
+				delete(authFailMap, k)
+			}
+		}
+	}
 	var e = authFailMap[ip]
-	if time.Since(e.since) > time.Minute {
-		e = authFailEntry{0, time.Now()}
+	if now.Sub(e.since) > time.Minute {
+		e = authFailEntry{0, now}
 	}
 	e.n++
-	e.since = e.since.UTC()
-	if e.since.IsZero() {
-		e.since = time.Now()
-	}
 	authFailMap[ip] = e
-	authFailMtx.Unlock()
 }
 
 func authClientIP(r *http.Request) string {
@@ -300,12 +306,41 @@ func authOK(app *App, w http.ResponseWriter, r *http.Request) bool {
 		_, _ = w.Write([]byte("rate limited"))
 		return false
 	}
-	authNoteFailure(ip)
+	// Only wrong credentials count toward the limit. A request without any
+	// Authorization header is the browser's normal first contact (it waits
+	// for the 401 challenge before sending credentials); a page load fires
+	// many of them in parallel (assets, SSE, streams) and used to lock a
+	// legitimate user out with 429 before the login dialog was even answered.
+	if ok {
+		authNoteFailure(ip)
+	}
 	secureHeaders(w)
 	w.Header().Set("WWW-Authenticate", "Basic realm=\"taponvr\"")
 	w.WriteHeader(401)
 	_, _ = w.Write([]byte("unauthorized"))
 	return false
+}
+
+// listenHost normalizes server.host for net.Listen: empty, 0.0.0.0 and the
+// legacy "[IP_ADDRESS]" placeholder (an old default) all mean every interface.
+func listenHost(h string) string {
+	var host = strings.Trim(strings.TrimSpace(h), "[]")
+	if host == "" || host == "0.0.0.0" || host == "IP_ADDRESS" {
+		return ""
+	}
+	return host
+}
+
+// probeHost is the address a local client (the container healthcheck) should
+// dial to reach the server: loopback when listening on every interface,
+// otherwise the configured bind address (127.0.0.1 is unreachable when the
+// server is bound to one specific LAN IP).
+func probeHost(h string) string {
+	var host = listenHost(h)
+	if host == "" || host == "::" {
+		return "127.0.0.1"
+	}
+	return host
 }
 
 // serve starts the HTTP server and blocks.
@@ -341,11 +376,7 @@ func serve(app *App) error {
 		handle(app, w, r)
 	})
 	// server.host is honored when set (empty or 0.0.0.0 = all interfaces).
-	var host = strings.TrimSpace(app.cfg.Server.Host)
-	if host == "" || host == "0.0.0.0" || host == "[IP_ADDRESS]" {
-		host = ""
-	}
-	var addr = net.JoinHostPort(host, strconv.Itoa(app.cfg.Server.Port))
+	var addr = net.JoinHostPort(listenHost(app.cfg.Server.Host), strconv.Itoa(app.cfg.Server.Port))
 	logIt(LINFO, "http server listening", map[string]string{"addr": addr})
 	// Explicit timeouts: without them a slow (or malicious) client can pin
 	// goroutines and sockets indefinitely, and /onvif/notify is reachable
@@ -1520,33 +1551,7 @@ func handleDetectionDelete(app *App, w http.ResponseWriter, r *http.Request, pat
 		// DB first, then files/S3 (same ordering as delete-all and pruneOnce):
 		// a crash between the steps never leaves a DB row pointing at
 		// missing media. DB failures are reported (no silent ok:true).
-		var dberr error
-		if tx, terr := app.db.db.Begin(); terr == nil {
-			var e1, e2, ec error
-			_, e1 = tx.Exec("DELETE FROM detections WHERE id=?", id)
-			_, e2 = tx.Exec("DELETE FROM vision_results WHERE detection_id=?", id)
-			if e1 == nil && e2 == nil {
-				ec = tx.Commit()
-			} else {
-				_ = tx.Rollback()
-			}
-			if e1 != nil {
-				dberr = e1
-			} else if e2 != nil {
-				dberr = e2
-			} else {
-				dberr = ec
-			}
-		} else {
-			dberr = terr
-			if _, e := app.db.db.Exec("DELETE FROM detections WHERE id=?", id); e != nil {
-				dberr = e
-			} else if e := dbDeleteVisionResults(app.db, id); e != nil {
-				dberr = e
-			} else {
-				dberr = nil
-			}
-		}
+		var dberr = dbDeleteDetectionRows(app.db, id)
 		if dberr != nil {
 			writeJSON(w, 500, "{\"error\":"+jsonString(dberr.Error())+"}")
 			return
@@ -1571,6 +1576,9 @@ func handleDetectionDelete(app *App, w http.ResponseWriter, r *http.Request, pat
 			var e1, e2, ec error
 			_, e1 = tx.Exec("DELETE FROM detections")
 			_, e2 = tx.Exec("DELETE FROM vision_results")
+			if e2 == nil {
+				_, e2 = tx.Exec("DELETE FROM vision_overrides")
+			}
 			if e1 == nil && e2 == nil {
 				ec = tx.Commit()
 			} else {
@@ -1588,6 +1596,8 @@ func handleDetectionDelete(app *App, w http.ResponseWriter, r *http.Request, pat
 			if _, e := app.db.db.Exec("DELETE FROM detections"); e != nil {
 				dberr = e
 			} else if _, e := app.db.db.Exec("DELETE FROM vision_results"); e != nil {
+				dberr = e
+			} else if _, e := app.db.db.Exec("DELETE FROM vision_overrides"); e != nil {
 				dberr = e
 			} else {
 				dberr = nil
@@ -1991,6 +2001,27 @@ func handleS3Retry(app *App, w http.ResponseWriter, r *http.Request) {
 	var queued = dbCount(app.db, "SELECT COUNT(*) FROM detections WHERE uploaded=0 AND s3_expected=1")
 	go s3RetryLoop(app)
 	writeJSON(w, 200, "{\"ok\":true,\"running\":true,\"queued\":"+strconv.FormatInt(queued, 10)+"}")
+}
+
+// s3RetryAuto starts a background retry of pending S3 uploads (hourly tick)
+// when uploads are enabled, S3 is configured, something is pending and no
+// retry is already running. Failed uploads would otherwise stay pending until
+// someone pressed the retry button.
+func s3RetryAuto(app *App) {
+	if !s3UploadEnabled() || app.cfg.Storage.S3.Endpoint == "" || app.cfg.Storage.S3.Bucket == "" {
+		return
+	}
+	if dbCount(app.db, "SELECT COUNT(*) FROM detections WHERE uploaded=0 AND s3_expected=1") == 0 {
+		return
+	}
+	s3RetryMtx.Lock()
+	if s3RetryRunning {
+		s3RetryMtx.Unlock()
+		return
+	}
+	s3RetryRunning = true
+	s3RetryMtx.Unlock()
+	go s3RetryLoop(app)
 }
 
 // s3RetryLoop uploads every pending row's present files and marks it uploaded

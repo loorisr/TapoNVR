@@ -17,7 +17,26 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./src/
+
+      - name: Test
+        run: go test -race ./src/
+
   build-and-push:
+    # Never publish an image whose tests fail.
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -48,6 +67,9 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          # The builder cross-compiles (see Dockerfile), so no QEMU is needed.
+          # arm64 covers Raspberry Pi 4/5, arm/v7 older 32-bit Pi OS installs.
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

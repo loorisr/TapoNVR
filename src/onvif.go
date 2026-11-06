@@ -1304,6 +1304,15 @@ func handleOnvifNotify(app *App, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if idx >= 0 {
+		// A camera disabled (enabled:false) or moved off the ONVIF source
+		// can keep pushing until its old subscription expires on the camera
+		// side: ignore it, like the poller and recorder do.
+		var c = &app.cfg.Cameras[idx]
+		if !c.Enabled || !sourceHas(camDetectionSource(app.cfg, c), "onvif") {
+			idx = -1
+		}
+	}
 	if idx < 0 {
 		// Not subscribed yet; log at low severity only.
 		writeJSON(w, 200, "{\"ok\":false}")

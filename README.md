@@ -437,7 +437,7 @@ from the event time).
 | `GET/POST /api/recording/state?enabled=` | Clip recording switch |
 | `GET/POST /api/snapshots/state?enabled=` | Snapshot switch |
 | `GET/POST /api/s3/state?enabled=` | S3 upload switch (uploads only; deletes always run) |
-| `POST /api/s3/retry` | Re-upload recordings pending S3 (`s3_expected=1 AND uploaded=0`) in background |
+| `POST /api/s3/retry` | Re-upload recordings pending S3 (`s3_expected=1 AND uploaded=0`) in background (also runs automatically every hour) |
 | `GET/POST /api/pushover/state?enabled=` | Push notification switch (throttled by `alerts.pushover.min_interval_s`) |
 | `GET /api/mqtt/status` | MQTT connection + feature states |
 | `GET /api/system/backup` | Backup descriptor JSON (config snapshot + DB/media inventory; see [Backup and restore](#backup-and-restore)) |

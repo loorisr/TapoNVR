@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -160,15 +161,19 @@ func runHealthcheck(args []string) int {
 		}
 	}
 	var port = 8971
+	var host = "127.0.0.1"
 	// Quiet: loadConfig warns on clamped values; a probe every 30s must not
 	// spam docker logs.
 	quietConfigLogs = true
-	if cfg, err := loadConfig(path); err == nil && cfg.Server.Port != 0 {
-		port = cfg.Server.Port
+	if cfg, err := loadConfig(path); err == nil {
+		if cfg.Server.Port != 0 {
+			port = cfg.Server.Port
+		}
+		host = probeHost(cfg.Server.Host)
 	}
 	quietConfigLogs = false
 	var client = &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", port))
+	resp, err := client.Get("http://" + net.JoinHostPort(host, strconv.Itoa(port)) + "/api/status")
 	if err != nil {
 		return 1
 	}

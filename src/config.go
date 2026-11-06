@@ -474,7 +474,7 @@ func clampPerCamDetection(c *Config) {
 }
 
 func configDefaults(c *Config) {
-	c.Server.Host = "[IP_ADDRESS]"
+	c.Server.Host = "0.0.0.0"
 	c.Server.Port = 8971
 	c.Server.DataDir = "./data"
 	c.Server.RetentionDays = 7
