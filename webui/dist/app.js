@@ -220,12 +220,13 @@ if (_detToggleEl) _detToggleEl.onclick = function () {
 };
 
 // Generic header toggle: GETs state on load, POSTs flipped value on click.
-function makeToggle(id, path, label) {
+function makeToggle(id, path, label, onChange) {
   var el = document.getElementById(id);
   if (!el) return;
   var on = false;
   function render(v) {
     on = !!v;
+    if (onChange) onChange(on);
     el.hidden = false;
     el.className = on ? "det-on" : "det-off";
     el.textContent = label + ": " + (on ? "ON" : "OFF");
@@ -243,6 +244,129 @@ function refreshToggles() {
   makeToggle("s3Toggle", "/api/s3/state", "S3");
   makeToggle("pushToggle", "/api/pushover/state", "Push");
   makeToggle("visionToggle", "/api/vision/state", "Vision");
+  makeToggle("llmToggle", "/api/llm/state", "LLM", function (on) {
+    var changed = _llmOn !== on;
+    _llmOn = on;
+    if (changed && curDetail) renderLLMPanel(curDetail);
+  });
+}
+
+// ---------- downloads ----------
+// withQuery appends one query parameter to a same-origin API URL.
+function withQuery(u, kv) { return u + (u.indexOf("?") >= 0 ? "&" : "?") + kv; }
+// dlLink builds an <a download> styled as a small button.
+function dlLink(href, text, title) {
+  var a = document.createElement("a");
+  a.className = "btn-sm";
+  a.href = href;
+  a.setAttribute("download", "");
+  a.textContent = text;
+  if (title) a.title = title;
+  a.onclick = function (e) { e.stopPropagation(); };
+  return a;
+}
+function renderDownloads(d) {
+  var bar = document.getElementById("ddl");
+  if (!bar) return;
+  bar.innerHTML = "";
+  var snaps = d.snapshots && d.snapshots.length ? d.snapshots : (d.snapshot ? [d.snapshot] : []);
+  if (d.clip && _safeMediaURL(d.clip)) bar.appendChild(dlLink(withQuery(d.clip, "download=1"), "⬇ Video", "Download the clip"));
+  if (snaps.length === 1) bar.appendChild(dlLink(withQuery(snaps[0], "download=1"), "⬇ Snapshot", "Download the snapshot"));
+  if (d.download && (snaps.length > 1 || (snaps.length && d.clip))) {
+    bar.appendChild(dlLink(d.download, "⬇ All (zip)", "Snapshots + video + metadata in one zip"));
+  }
+  bar.hidden = !bar.childNodes.length;
+}
+
+// ---------- vision LLM ----------
+var _llmOn = false;
+function llmSourceLabel(s) {
+  return { snapshots: "snapshots", video: "video", both: "snapshots + video" }[s] || s || "";
+}
+function llmBadgeHTML(d) {
+  if (!d || !d.llm || !d.llm.summary) return "";
+  return " <span class='badge llm-badge' title='" + esc(d.llm.summary) + "'>🤖</span>";
+}
+function renderLLMPanel(d) {
+  var el = document.getElementById("dllm");
+  if (!el) return;
+  el.innerHTML = "";
+  var r = d.llm;
+  if (!_llmOn && !r) { el.hidden = true; return; }
+  el.hidden = false;
+  var head = document.createElement("div");
+  head.className = "meta";
+  var bits = ["🤖 LLM description"];
+  if (r && r.summary) {
+    if (r.model) bits.push(r.model);
+    if (r.source) bits.push(llmSourceLabel(r.source) + (r.images ? " (" + r.images + " img)" : ""));
+    if (r.ms) bits.push((r.ms / 1000).toFixed(1) + " s");
+    if (r.at) bits.push(new Date(r.at * 1000).toLocaleString());
+  }
+  head.textContent = bits.join(" · ");
+  el.appendChild(head);
+  if (d.llm_pending) {
+    var wait = document.createElement("div");
+    wait.className = "meta";
+    wait.textContent = "⏳ Analysis in progress…";
+    el.appendChild(wait);
+  }
+  if (r && r.summary) {
+    var txt = document.createElement("div");
+    txt.className = "llm-text";
+    txt.textContent = r.summary;
+    el.appendChild(txt);
+  } else if (!d.llm_pending && !(r && r.error)) {
+    var none = document.createElement("div");
+    none.className = "meta";
+    none.textContent = "Not analyzed yet.";
+    el.appendChild(none);
+  }
+  if (r && r.error) {
+    var er = document.createElement("div");
+    er.className = "llm-error";
+    er.textContent = "Last attempt failed: " + r.error;
+    el.appendChild(er);
+  }
+  if (!_llmOn) return;
+  var ctl = document.createElement("div");
+  ctl.className = "llm-controls";
+  var sel = document.createElement("select");
+  sel.title = "What to send to the model";
+  [["", "Default source"], ["snapshots", "Snapshots"], ["video", "Video keyframes"], ["both", "Snapshots + video"]].forEach(function (o) {
+    var op = document.createElement("option");
+    op.value = o[0]; op.textContent = o[1];
+    sel.appendChild(op);
+  });
+  var btn = document.createElement("button");
+  btn.className = "btn-sm";
+  btn.type = "button";
+  btn.textContent = r && r.summary ? "↻ Re-analyze" : "🤖 Analyze";
+  btn.disabled = !!d.llm_pending;
+  btn.onclick = function () {
+    btn.disabled = true;
+    var q = sel.value ? "?source=" + encodeURIComponent(sel.value) : "";
+    fetch("/api/detections/" + encodeURIComponent(d.id) + "/llm" + q, { method: "POST", headers: headers() })
+      .then(function (res) { return res.json().catch(function () { return {}; }).then(function (j) { return { ok: res.ok, body: j }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error((res.body && res.body.error) || "analysis failed");
+        d.llm_pending = true;
+        if (curDetail === d) renderLLMPanel(d);
+        toast("LLM analysis queued.", "info");
+      })
+      .catch(function (e) { btn.disabled = false; toast("LLM: " + e.message, "error"); });
+  };
+  ctl.appendChild(sel);
+  ctl.appendChild(btn);
+  el.appendChild(ctl);
+}
+// refreshLLMDetail re-reads one detection's LLM result (after an SSE event).
+function refreshLLMDetail(d) {
+  api("/api/detections/" + encodeURIComponent(d.id) + "/llm").then(function (j) {
+    d.llm = j.llm;
+    d.llm_pending = !!j.pending;
+    if (curDetail === d) renderLLMPanel(d);
+  }).catch(function () {});
 }
 
 // ---------- vision (YOLO) helpers ----------
@@ -906,6 +1030,7 @@ function refreshSystemStatus() {
       statCard("Recording", pill(st.recording_enabled === "true" || st.recording_enabled === true) + " <span class='meta'>" + esc(st.record_mode || "") + "</span>") +
       statCard("Snapshots", pill(st.snapshots_enabled === "true" || st.snapshots_enabled === true)) +
       statCard("Vision (YOLO)", visionStatusHTML(st, wk)) +
+      statCard("LLM description", pill(st.llm_enabled === "true" || st.llm_enabled === true) + (st.llm_model ? " <span class='meta'>" + esc(st.llm_provider || "") + " · " + esc(st.llm_model) + "</span>" : "")) +
       statCard("Uptime", esc(fmtUptime(st.uptime))) +
       statCard("Retention", esc(st.retention_days) + " <span class='meta'>days</span>");
     var sbox = document.getElementById("sysStats");
@@ -1325,8 +1450,12 @@ function renderRecordingsGrid(list){
         .catch(function(err){ toast("Delete failed: "+err.message, "error"); })
         .finally(function(){ del.disabled=false; });
     };
-    actions.appendChild(btnSnap); actions.appendChild(btnVid); actions.appendChild(lab); actions.appendChild(del);
-    info.appendChild(title); info.appendChild(meta1); info.appendChild(meta2); info.appendChild(actions);
+    actions.appendChild(btnSnap); actions.appendChild(btnVid);
+    if(d.download && (d.snapshot || d.clip)) actions.appendChild(dlLink(d.download, "⬇", "Download snapshots + video (zip)"));
+    actions.appendChild(lab); actions.appendChild(del);
+    info.appendChild(title); info.appendChild(meta1); info.appendChild(meta2);
+    if(d.llm && d.llm.summary){ var sum=document.createElement("div"); sum.className="rec-summary"; sum.textContent="🤖 "+d.llm.summary; sum.title=d.llm.summary; info.appendChild(sum); }
+    info.appendChild(actions);
     card.appendChild(thumb); card.appendChild(info); box.appendChild(card);
   });
 }
@@ -1490,7 +1619,7 @@ function renderDetections(list) {
       else { tdS3.textContent = "—"; tdS3.className = "meta"; tdS3.title = "Not uploaded to S3"; }
       var tdType = document.createElement("td");
       var vb2 = visionBadgeText(d);
-      tdType.innerHTML = detectionBadgesHTML(detectionTypeList(d)) + (vb2 ? " <span class='badge vision-badge' title='"+esc((d.vision&&d.vision.error)||"YOLO")+"'>" + esc(vb2) + "</span>" : "");
+      tdType.innerHTML = detectionBadgesHTML(detectionTypeList(d)) + (vb2 ? " <span class='badge vision-badge' title='"+esc((d.vision&&d.vision.error)||"YOLO")+"'>" + esc(vb2) + "</span>" : "") + llmBadgeHTML(d);
       var tdCam = document.createElement("td");
       tdCam.textContent = d.camera_name || d.camera_id || "";
       var tdGid = document.createElement("td"); tdGid.textContent=(d.id||'').slice(0,8); tdGid.className="mono"; tdGid.title=d.id||'';
@@ -1540,6 +1669,7 @@ function renderDetections(list) {
       tdAct.appendChild(btnSnap);
       tdAct.appendChild(btnVid);
       tdAct.appendChild(btnTl);
+      if (d.download && (d.snapshot || d.clip)) tdAct.appendChild(dlLink(d.download, "⬇", "Download snapshots + video (zip)"));
       tdAct.appendChild(lockBtn);
       tdAct.appendChild(del);
       tr.appendChild(tdTime);
@@ -1737,6 +1867,8 @@ function renderDetailTab() {
       // server annotates only files with a positive per-snapshot result
       // and serves the plain JPEG otherwise (?boxes=1 is per-file safe)
       var src = visionBoxesURL(d, u);
+      var item = document.createElement("div");
+      item.className = "snap-item";
       var img = document.createElement("img");
       _imgFallback(img, "snapshot manquant");
       img.src = src;
@@ -1744,7 +1876,15 @@ function renderDetailTab() {
       img.loading = "lazy";
       img.style.cursor = "zoom-in";
       img.onclick = function () { showLightbox(src); };
-      snaps.appendChild(img);
+      var dl = document.createElement("a");
+      dl.className = "snap-dl";
+      dl.href = withQuery(u, "download=1");
+      dl.setAttribute("download", "");
+      dl.textContent = "⬇";
+      dl.title = "Download snapshot " + (i + 1);
+      item.appendChild(img);
+      item.appendChild(dl);
+      snaps.appendChild(item);
     });
     // vision section (summary + re-analyze) below snapshots
     var dv=document.getElementById("dvision");
@@ -1814,6 +1954,8 @@ function showDetail(d, mode) {
   document.getElementById("dtitle").textContent = d.camera_name + " · " + detectionTags(d) + " · " + new Date(d.started_at * 1000).toLocaleString();
   document.getElementById("dmeta").textContent =
     "duration " + fmtDuration(d.duration != null ? d.duration : (d.ended_at - d.started_at)) + " · size " + fmtSize(d.size) + " · confidence " + d.confidence + (d.uploaded ? " · ☁️ S3" : "") + (visionBadgeText(d) ? " · " + visionBadgeText(d) : "") + (bboxBadgeText(d) ? " · " + bboxBadgeText(d) : "");
+  renderDownloads(d);
+  renderLLMPanel(d);
   renderDetailTab();
   openDetailModal();
 }
@@ -1860,6 +2002,13 @@ function initEvents() {
     try { d = JSON.parse(ev.data); } catch (e) {}
     // vision analysis landed after the fact: refresh badges/boxes (debounced,
     // bursts analyze several snapshots within seconds).
+    if (d.kind === "llm") {
+      if (curDetail && curDetail.id === d.detection_id) refreshLLMDetail(curDetail);
+      if (activeTab === "recordings" && !_visionRefreshT) {
+        _visionRefreshT = setTimeout(function () { _visionRefreshT = null; refreshRecordings(); }, 2000);
+      }
+      return;
+    }
     if (d.kind === "vision") {
       if (_visionRefreshT) return;
       if (activeTab !== "recordings") return;

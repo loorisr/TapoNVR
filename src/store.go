@@ -102,6 +102,14 @@ func openDB(path string) (*DB, error) {
 		// Source(s) that produced the detection: onvif, rtsp, manual, test.
 		// Merged detections keep every source that extended the group.
 		"ALTER TABLE detections ADD COLUMN det_source TEXT DEFAULT ''",
+		// Vision-LLM description (llm.go).
+		"ALTER TABLE detections ADD COLUMN llm_summary TEXT DEFAULT ''",
+		"ALTER TABLE detections ADD COLUMN llm_model TEXT DEFAULT ''",
+		"ALTER TABLE detections ADD COLUMN llm_source TEXT DEFAULT ''",
+		"ALTER TABLE detections ADD COLUMN llm_error TEXT DEFAULT ''",
+		"ALTER TABLE detections ADD COLUMN llm_at INTEGER DEFAULT 0",
+		"ALTER TABLE detections ADD COLUMN llm_ms REAL DEFAULT 0",
+		"ALTER TABLE detections ADD COLUMN llm_images INTEGER DEFAULT 0",
 	} {
 		if _, err := store.db.Exec(mig); err != nil {
 			logIt(LDEBUG, "db migration skipped", map[string]string{"sql": mig, "error": err.Error()})
@@ -457,7 +465,7 @@ func dbSetLocked(store *DB, id string, locked bool) error {
 
 // getDetection returns one detection by id, or nil.
 func getDetection(store *DB, id string) (*Detection, error) {
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections WHERE id=?"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source, COALESCE(llm_summary,''), COALESCE(llm_model,''), COALESCE(llm_source,''), COALESCE(llm_error,''), COALESCE(llm_at,0), COALESCE(llm_ms,0), COALESCE(llm_images,0) FROM detections WHERE id=?"
 	var rs, e = store.db.Query(q, id)
 	if e != nil {
 		return nil, e
@@ -479,7 +487,7 @@ func getDetection(store *DB, id string) (*Detection, error) {
 		var bbox sql.NullString
 		var dtypes sql.NullString
 		var dsource sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource, &d.llmSummary, &d.llmModel, &d.llmSource, &d.llmError, &d.llmAt, &d.llmMs, &d.llmImages); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -521,7 +529,7 @@ func getDetection(store *DB, id string) (*Detection, error) {
 // operations like delete-all that must not silently skip old rows.
 func listAllDetections(store *DB) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections ORDER BY started_at DESC"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source, COALESCE(llm_summary,''), COALESCE(llm_model,''), COALESCE(llm_source,''), COALESCE(llm_error,''), COALESCE(llm_at,0), COALESCE(llm_ms,0), COALESCE(llm_images,0) FROM detections ORDER BY started_at DESC"
 	var rs, e = store.db.Query(q)
 	if e != nil {
 		return nil, e
@@ -543,7 +551,7 @@ func listAllDetections(store *DB) ([]Detection, error) {
 		var bbox sql.NullString
 		var dtypes sql.NullString
 		var dsource sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource, &d.llmSummary, &d.llmModel, &d.llmSource, &d.llmError, &d.llmAt, &d.llmMs, &d.llmImages); serr != nil {
 			return nil, serr
 		}
 		if extra.Valid {
@@ -641,7 +649,7 @@ func likeEscape(s string) string {
 // the first page stay reachable; countDetectionsFiltered returns the total.
 func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtype string, label string, hasVision bool, limit int, offset int) ([]Detection, error) {
 	var out []Detection
-	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source FROM detections"
+	var q = "SELECT id, camera_id, name, det_type, confidence, started_at, ended_at, snapshot_path, clip_path, extra_snapshots, locked, uploaded, s3_expected, size_bytes, vision_json, vision_count, vision_top, vision_ms, vision_error, vision_at, bbox_json, det_types, det_source, COALESCE(llm_summary,''), COALESCE(llm_model,''), COALESCE(llm_source,''), COALESCE(llm_error,''), COALESCE(llm_at,0), COALESCE(llm_ms,0), COALESCE(llm_images,0) FROM detections"
 	var cond []string
 	if from > 0 {
 		cond = append(cond, "started_at >= ?")
@@ -712,7 +720,7 @@ func listDetectionsFiltered(store *DB, from int64, to int64, camera string, dtyp
 		var bbox sql.NullString
 		var dtypes sql.NullString
 		var dsource sql.NullString
-		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource); serr != nil {
+		if serr := rs.Scan(&d.id, &d.cameraID, &d.camName, &d.detType, &d.confidence, &d.startedAt, &d.endedAt, &d.snapshotPath, &d.clipPath, &extra, &locked, &uploaded, &expected, &sizeB, &vjson, &vcount, &vtop, &vms, &verr, &vat, &bbox, &dtypes, &dsource, &d.llmSummary, &d.llmModel, &d.llmSource, &d.llmError, &d.llmAt, &d.llmMs, &d.llmImages); serr != nil {
 			rs.Close()
 			return nil, serr
 		}
@@ -1004,6 +1012,17 @@ type Detection struct {
 	// ("onvif", "rtsp", "manual", "test"), comma-separated in first-seen
 	// order. Empty on rows created before the column existed.
 	detSource string
+	// LLM fields: optional vision-LLM description of the snapshots and/or
+	// clip keyframes (see llm.go). llmSource is what was analyzed
+	// (snapshots|video|both), llmImages how many images were sent, llmError
+	// the last failure, llmAt the unix time of the last attempt.
+	llmSummary string
+	llmModel   string
+	llmSource  string
+	llmError   string
+	llmAt      int64
+	llmMs      float64
+	llmImages  int
 }
 
 // fileSize returns the size of path or 0 when missing.

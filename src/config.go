@@ -291,6 +291,53 @@ type VisionCfg struct {
 	MaxWorkers int `yaml:"max_workers"`
 }
 
+// LLMCfg configures the optional vision-LLM description of detections: the
+// snapshots and/or keyframes sampled from the clip are sent to a multimodal
+// model, which returns a short natural-language summary stored on the row.
+// Disabled by default.
+type LLMCfg struct {
+	// Enabled master switch (also flippable at runtime via /api/llm/state).
+	Enabled bool `yaml:"enabled"`
+	// Provider is "anthropic" (Claude, official SDK) or "openai" (any
+	// OpenAI-compatible chat completions API: Ollama, LM Studio, vLLM,
+	// llama.cpp server, OpenRouter, OpenAI...).
+	Provider string `yaml:"provider"`
+	// URL is the API base URL. anthropic: optional override (empty = the
+	// official endpoint). openai: required, e.g. http://127.0.0.1:11434/v1.
+	URL string `yaml:"url"`
+	// APIKey authenticates the requests. anthropic: empty falls back to the
+	// ANTHROPIC_API_KEY environment variable. openai: optional (local
+	// servers usually need none).
+	APIKey string `yaml:"api_key"`
+	// Model is the model id (anthropic default claude-opus-5-5; openai e.g.
+	// qwen2.5vl:7b, llava, gpt-4o).
+	Model string `yaml:"model"`
+	// Effort (anthropic only): low|medium|high|xhigh|max.
+	Effort string `yaml:"effort"`
+	// Source selects what is analyzed: snapshots, video (keyframes sampled
+	// from the clip) or both.
+	Source string `yaml:"source"`
+	// MaxImages caps the images sent per request (1..20).
+	MaxImages int `yaml:"max_images"`
+	// ImageMaxPx caps the long edge of each image sent (aspect kept, 256..2048).
+	ImageMaxPx int `yaml:"image_max_px"`
+	// TimeoutS bounds one request (10..600 seconds).
+	TimeoutS int `yaml:"timeout_s"`
+	// MaxTokens caps the response length.
+	MaxTokens int `yaml:"max_tokens"`
+	// Prompt replaces the default instructions (camera, time and tags are
+	// still added as context).
+	Prompt string `yaml:"prompt"`
+	// Language of the answer, e.g. "French". Empty = English.
+	Language string `yaml:"language"`
+	// Auto analyzes every new detection once its media is ready. false =
+	// on demand only (WebUI button / POST /api/detections/{id}/llm).
+	Auto bool `yaml:"auto"`
+	// Events restricts automatic analysis to these detection types (motion,
+	// person, vehicle, pet, other). Empty = every type.
+	Events []string `yaml:"events"`
+}
+
 type OnvifCfg struct {
 	Url      string `yaml:"url"`
 	Username string `yaml:"username"`
@@ -382,6 +429,7 @@ type Config struct {
 	Alerts    AlertsCfg    `yaml:"alerts"`
 	Mqtt      MqttCfg      `yaml:"mqtt"`
 	Vision    VisionCfg    `yaml:"vision"`
+	LLM       LLMCfg       `yaml:"llm"`
 	Detection DetectionCfg `yaml:"detection"`
 	Cameras   []CameraCfg  `yaml:"cameras"`
 }
@@ -529,6 +577,16 @@ func configDefaults(c *Config) {
 	c.Vision.Classes = ""
 	c.Vision.Snapshots = "primary"
 	c.Vision.MaxWorkers = 2
+	c.LLM.Enabled = false
+	c.LLM.Provider = "anthropic"
+	c.LLM.Model = "claude-opus-5-5"
+	c.LLM.Effort = "low"
+	c.LLM.Source = "snapshots"
+	c.LLM.MaxImages = 6
+	c.LLM.ImageMaxPx = 1024
+	c.LLM.TimeoutS = 120
+	c.LLM.MaxTokens = 16000
+	c.LLM.Auto = true
 	c.Detection.Source = "onvif"
 	c.Detection.RTSP.Transport = "tcp"
 	c.Detection.RTSP.DebounceS = 10
@@ -776,6 +834,7 @@ func loadConfig(path string) (*Config, error) {
 		c.Vision.Snapshots = "primary"
 	}
 	c.Vision.URL = strings.TrimSuffix(strings.TrimSpace(c.Vision.URL), "/")
+	clampLLMConfig(&c.LLM)
 	// Clamp the go2rtc log level now (not just warn): the generated go2rtc
 	// config carries it verbatim. validateConfig re-clamps for configs that
 	// bypass loadConfig.
@@ -844,4 +903,80 @@ func loadConfig(path string) (*Config, error) {
 	}
 	validateConfig(&c)
 	return &c, nil
+}
+
+// clampLLMConfig normalizes the llm section: unknown enum values fall back to
+// their defaults and numeric fields are clamped to safe ranges.
+func clampLLMConfig(l *LLMCfg) {
+	switch strings.ToLower(strings.TrimSpace(l.Provider)) {
+	case "", "anthropic", "claude":
+		l.Provider = "anthropic"
+	case "openai", "openai-compatible", "ollama":
+		l.Provider = "openai"
+	default:
+		configWarn("config clamped: llm.provider must be anthropic|openai, using anthropic", map[string]string{"value": l.Provider})
+		l.Provider = "anthropic"
+	}
+	l.Model = strings.TrimSpace(l.Model)
+	if l.Model == "" && l.Provider == "anthropic" {
+		l.Model = "claude-opus-5-5"
+	}
+	if l.Enabled && l.Model == "" {
+		configWarn("config: llm.model is empty (required for provider openai)", nil)
+	}
+	l.URL = strings.TrimSuffix(strings.TrimSpace(l.URL), "/")
+	if l.Enabled && l.Provider == "openai" && l.URL == "" {
+		configWarn("config: llm.url is empty (required for provider openai, e.g. http://127.0.0.1:11434/v1)", nil)
+	}
+	switch strings.ToLower(strings.TrimSpace(l.Effort)) {
+	case "low", "medium", "high", "xhigh", "max":
+		l.Effort = strings.ToLower(strings.TrimSpace(l.Effort))
+	case "":
+		l.Effort = "low"
+	default:
+		configWarn("config clamped: llm.effort must be low|medium|high|xhigh|max, using low", map[string]string{"value": l.Effort})
+		l.Effort = "low"
+	}
+	switch strings.ToLower(strings.TrimSpace(l.Source)) {
+	case "", "snapshots", "snapshot", "images":
+		l.Source = "snapshots"
+	case "video", "clip":
+		l.Source = "video"
+	case "both", "all":
+		l.Source = "both"
+	default:
+		configWarn("config clamped: llm.source must be snapshots|video|both, using snapshots", map[string]string{"value": l.Source})
+		l.Source = "snapshots"
+	}
+	if l.MaxImages < 1 || l.MaxImages > 20 {
+		configWarn("config clamped: llm.max_images not in 1..20, using 6", nil)
+		l.MaxImages = 6
+	}
+	if l.ImageMaxPx < 256 || l.ImageMaxPx > 2048 {
+		configWarn("config clamped: llm.image_max_px not in 256..2048, using 1024", nil)
+		l.ImageMaxPx = 1024
+	}
+	if l.TimeoutS < 10 || l.TimeoutS > 600 {
+		configWarn("config clamped: llm.timeout_s not in 10..600, using 120", nil)
+		l.TimeoutS = 120
+	}
+	if l.MaxTokens < 256 || l.MaxTokens > 64000 {
+		configWarn("config clamped: llm.max_tokens not in 256..64000, using 16000", nil)
+		l.MaxTokens = 16000
+	}
+	var events []string
+	for _, e := range l.Events {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if !detectionLabels[e] {
+			configWarn("config: ignoring unknown llm.events entry", map[string]string{"type": e})
+			continue
+		}
+		if !slices.Contains(events, e) {
+			events = append(events, e)
+		}
+	}
+	l.Events = events
 }

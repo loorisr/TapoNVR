@@ -72,6 +72,8 @@ YAML file.
 - Camera-side AI boxes and type read directly from H.264 SEI metadata.
 - Live bounding-box overlay and a detection timeline.
 - Optional YOLO sidecar analysis for snapshots.
+- Optional vision-LLM description of each detection (snapshots and/or clip
+  keyframes) with Claude or any OpenAI-compatible local model (Ollama, …).
 
 **Integrations and operations**
 - Local storage plus S3-compatible upload (MinIO, Cloudflare R2, …).
@@ -408,6 +410,8 @@ from the event time).
 | `GET /api/detections/{id}/snapshot` | Snapshot JPEG |
 | `GET /api/detections/{id}/snapshot?boxes=1` | Snapshot JPEG with boxes burned in (its own YOLO result, else the camera's RTSP SEI boxes; serve-time only, stored file untouched; plain JPEG when neither applies) |
 | `GET /api/detections/{id}/clip` | Clip MP4 |
+| `GET /api/detections/{id}/clip?download=1` (also `snapshot`, `snapshot/{n}`) | Same file as an attachment (browser download) |
+| `GET /api/detections/{id}/download` | Zip of every media file of the detection (snapshots, clip) plus `detection.json` |
 | `GET /api/detections/{id}/timeline` | Timeline data for the detail modal (start/end, raw events, YOLO results, clip/S3 status) |
 | `POST /api/detections/{id}/lock` | Lock/unlock a recording (`{"locked":true}`); locked recordings are excluded from automatic pruning |
 | `DELETE /api/detections/{id}` | Delete a detection (snapshot + clip + extras) |
@@ -426,6 +430,14 @@ from the event time).
 | `GET /api/detections/{id}/vision` | YOLO results: best-result summary + per-snapshot `results[]` (index, snapshot URL, boxes) |
 | `POST /api/detections/{id}/vision` | Re-analyze the primary snapshot with YOLO now |
 | `POST /api/detections/{id}/vision/exclude` | Vision feedback: exclude a wrong YOLO label (`{"snap_index":0,"label":"person"}`); 404 when unsupported |
+
+### Vision LLM
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET/POST /api/llm/state?enabled=` | LLM description switch (also MQTT `<prefix>/llm/set`) |
+| `GET /api/detections/{id}/llm` | LLM result (`summary`, `model`, `source`, `images`, `error`, `at`, `ms`) and `pending` |
+| `POST /api/detections/{id}/llm?source=snapshots\|video\|both` | Analyze now (202, async); the result arrives over SSE (`kind: "llm"`) and MQTT |
 
 ### System, storage and toggles
 
@@ -530,6 +542,13 @@ extras) and the clip for a detection are uploaded.
   `{snap_index, label}`). A 404 (older server) toasts gracefully; otherwise the
   label is excluded from future filtering/ranking.
 
+- **Downloads:** the detail modal offers ⬇ buttons for the clip, each
+  snapshot and a zip of everything; the recordings table and grid have a ⬇
+  (zip) action per detection.
+- **LLM description:** when `llm` is enabled, the detail modal shows the
+  model's summary (🤖 badge in the list) and an Analyze / Re-analyze button
+  with a source selector (snapshots, video keyframes or both).
+
 ## Testing
 
 `go build` validates the whole binary. A simulated, end-to-end detection can be
@@ -620,6 +639,14 @@ After running, review with `git diff --stat` and rebuild via
   automatic attempts back off from 15 s to 5 min and only the first failure logs
   a WARN (`workers.vision_backoff*` in `/api/system/status`). An explicit
   re-analyze from the UI always retries.
+- **Vision LLM.** Video analysis sends keyframes (IDR frames) sampled evenly
+  across the clip, decoded in pure Go like the snapshots: models take images,
+  not video files. Automatic analysis waits until the snapshot burst and the
+  clip are done, runs one request at a time, and pauses for 30 s to 15 min
+  after repeated API failures (on-demand requests always run). With a paid
+  API every analyzed detection costs one request: use `llm.events` or
+  `llm.auto: false` to keep it in check. The Claude SDK adds about 5 MB to the
+  binary.
 - **Detection types are camera-defined.** ONVIF/RTSP are used for detection and
   (ONVIF) PTZ control; detection types are whatever the camera emits (motion /
   person / vehicle / pet / other).

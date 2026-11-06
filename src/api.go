@@ -142,6 +142,10 @@ func detJSON(d *Detection) string {
 		arr = append(arr, `"bbox":null`)
 	}
 	arr = append(arr, visionJSON(d))
+	arr = append(arr, llmJSON(d))
+	arr = append(arr, `"llm_pending":`+boolJSON(llmIsPending(d.id)))
+	// One-click archive of every media file of the detection.
+	arr = append(arr, kv("download", "/api/detections/"+d.id+"/download"))
 	return "{" + strings.Join(arr, ",") + "}"
 }
 
@@ -519,6 +523,18 @@ func handle(app *App, w http.ResponseWriter, r *http.Request) {
 	}
 	if path == "/api/vision/state" {
 		handleVisionState(app, w, r)
+		return
+	}
+	if strings.HasPrefix(path, "/api/detections/") && strings.HasSuffix(path, "/llm") {
+		handleDetectionLLM(app, w, r, path)
+		return
+	}
+	if strings.HasPrefix(path, "/api/detections/") && strings.HasSuffix(path, "/download") {
+		handleDetectionDownload(app, w, r, path)
+		return
+	}
+	if path == "/api/llm/state" {
+		handleLLMState(app, w, r)
 		return
 	}
 	if strings.HasPrefix(path, "/api/detections/") && strings.HasSuffix(path, "/vision") {
@@ -2523,6 +2539,9 @@ func handleSystemStatus(app *App, w http.ResponseWriter, r *http.Request) {
 		`,"vision_analyzed":` + strconv.FormatInt(visionAnalyzed, 10) +
 		`,"vision_avg_ms":` + fmt.Sprintf("%.1f", visionAvgMs) +
 		`,"vision_avg_total_ms":` + fmt.Sprintf("%.1f", visionAvgTotalMs) +
+		"," + kvRaw("llm_enabled", boolJSON(llmEnabled())) +
+		"," + kv("llm_provider", app.cfg.LLM.Provider) +
+		"," + kv("llm_model", app.cfg.LLM.Model) +
 		"," + kv("record_mode", app.cfg.Record.Mode) +
 		"," + kv("detection_source", app.cfg.Detection.Source) +
 		`,"retention_days":` + strconv.Itoa(app.cfg.Server.RetentionDays) +
@@ -2605,6 +2624,9 @@ func handleDetectionMedia(app *App, w http.ResponseWriter, r *http.Request, path
 			return
 		}
 		if f != "" {
+			if wantsDownload(r) {
+				setAttachment(w, filepath.Base(f))
+			}
 			// ?boxes=1 burns the YOLO boxes into the served JPEG (serve-time
 			// only, the stored file is untouched). Only when the detection
 			// has a positive result for THIS exact file (vision_snap).
@@ -2633,6 +2655,9 @@ func handleDetectionMedia(app *App, w http.ResponseWriter, r *http.Request, path
 		var clipType = "video/mp4"
 		if strings.HasSuffix(strings.ToLower(rec.clipPath), ".ts") {
 			clipType = "video/mp2t"
+		}
+		if wantsDownload(r) {
+			setAttachment(w, filepath.Base(rec.clipPath))
 		}
 		serveFile(w, r, rec.clipPath, clipType)
 		return

@@ -827,6 +827,7 @@ func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, even
 			b.unpin()
 		}
 		logIt(LWARN, "clip assembly dropped (pool saturated)", map[string]string{"id": detID, "pending": strconv.FormatInt(pending, 10)})
+		llmNoteReady(app, detID, llmNeedClip)
 		return
 	}
 	go func() {
@@ -844,6 +845,8 @@ func clipAssembleAsync(app *App, b *CameraBuffer, detID string, out string, even
 // While the camera reports the detection as active, the post-detection timer
 // does not start - it begins only once the camera sends an inactive event.
 func assembleClip(app *App, b *CameraBuffer, detID string, out string, eventT int64, pinHeld bool) {
+	// Runs last (after the clip path is stored), on every exit path.
+	defer llmNoteReady(app, detID, llmNeedClip)
 	markClipPending(detID)
 	defer unmarkClipPending(detID)
 	var preSec = int64(app.cfg.Record.PreDetection)
@@ -1499,21 +1502,21 @@ func grabSnapshotNative(app *App, camID string, dest string, deadline time.Time)
 	return false
 }
 
-// decodeH264AUToJpeg decodes a single complete H264 access unit (SPS/PPS+IDR)
-// via Eyevinn hi264 to a JPEG file. Shared by the live-RTSP and buffer paths.
-func decodeH264AUToJpeg(au [][]byte, camID, dest string) bool {
+// decodeH264AUToImage decodes a single complete H264 access unit
+// (SPS/PPS+IDR) via Eyevinn hi264 to an in-memory 4:2:0 image.
+func decodeH264AUToImage(au [][]byte, camID string) (*image.YCbCr, bool) {
 	if len(au) == 0 {
-		return false
+		return nil, false
 	}
 	annexb, err := h264.AnnexB(au).Marshal()
 	if err != nil {
-		return false
+		return nil, false
 	}
 	hidDec := decoder.New()
 	frame, err := hidDec.DecodeAnnexB(annexb)
 	if err != nil || frame == nil {
 		logIt(LDEBUG, "snapshot hi264 decode failed", map[string]string{"camera": camID, "error": fmt.Sprintf("%v", err)})
-		return false
+		return nil, false
 	}
 	// The hi264 decoder outputs 4:2:0 only. Guard the plane geometry before
 	// tagging it 420: a non-420 stream must fail loudly, not encode with
@@ -1522,18 +1525,27 @@ func decodeH264AUToJpeg(au [][]byte, camID, dest string) bool {
 	var h2 = (frame.Height + 1) / 2
 	if frame.StrideC < w2 || len(frame.Cb) < frame.StrideC*(h2-1)+w2 || len(frame.Cr) < frame.StrideC*(h2-1)+w2 || len(frame.Y) < frame.StrideY*(frame.Height-1)+frame.Width {
 		logIt(LDEBUG, "snapshot chroma geometry not 4:2:0, skipping", map[string]string{"camera": camID, "w": strconv.Itoa(frame.Width), "h": strconv.Itoa(frame.Height)})
-		return false
+		return nil, false
 	}
-	rect := image.Rect(0, 0, frame.Width, frame.Height)
-	ycbcr := &image.YCbCr{
+	return &image.YCbCr{
 		Y:              frame.Y,
 		Cb:             frame.Cb,
 		Cr:             frame.Cr,
 		YStride:        frame.StrideY,
 		CStride:        frame.StrideC,
-		Rect:           rect,
+		Rect:           image.Rect(0, 0, frame.Width, frame.Height),
 		SubsampleRatio: image.YCbCrSubsampleRatio420,
+	}, true
+}
+
+// decodeH264AUToJpeg decodes a single complete H264 access unit (SPS/PPS+IDR)
+// via Eyevinn hi264 to a JPEG file. Shared by the live-RTSP and buffer paths.
+func decodeH264AUToJpeg(au [][]byte, camID, dest string) bool {
+	ycbcr, ok := decodeH264AUToImage(au, camID)
+	if !ok {
+		return false
 	}
+	var frame = struct{ Width, Height int }{ycbcr.Rect.Dx(), ycbcr.Rect.Dy()}
 	f, err := os.Create(dest)
 	if err != nil {
 		return false
@@ -2342,6 +2354,15 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	// can wait on it; in "primary" mode it stays nil (legacy behavior).
 	var bestMode = snapOn && pushoverEnabled() && app.cfg.Alerts.Pushover.SendSnapshot && pushoverPickBest(app.cfg.Alerts.Pushover)
 	var snapSet *detSnapSet
+	// Vision LLM: register the detection before any async producer starts, so
+	// the analysis runs once the row, the timed snapshot burst and the clip it
+	// needs are all on disk (each producer reports below, success or not).
+	if src != "" && llmAutoActive(app) {
+		var ls = app.cfg.LLM.Source
+		var needSnaps = snapOn && (extraCount > 0 || continuous) && llmUsesSnapshots(ls)
+		var needClip = recordOn && app.cfg.Record.Mode == "buffer" && (llmUsesVideo(ls) || !snapOn)
+		llmTrack(app, id, needSnaps, needClip)
+	}
 
 	if src == "" {
 		// Test placeholder media (no-op rows for manual testing). The text
@@ -2445,6 +2466,7 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 			// the primary snapshot / detection.
 			if extraCount > 0 || continuous {
 				go func() {
+					defer llmNoteReady(app, id, llmNeedSnaps)
 					defer snapSet.finish() // nil-safe; wakes the notifier on every path
 					// Extras are buffer-first even in best mode: the SEI history
 					// pairs each frame with the boxes of its own timestamp and
@@ -2550,8 +2572,10 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	}
 	groupMtx.Unlock()
 	if derr != nil {
+		llmForget(id)
 		return nil, derr
 	}
+	llmNoteReady(app, id, llmNeedRow)
 	// S3 upload runs in the background: it can block for minutes on a hung
 	// endpoint and must not stall the ONVIF webhook response or the grouping
 	// path. Pushover is a separate goroutine so a slow upload never delays the

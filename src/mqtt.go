@@ -188,6 +188,11 @@ func mqttPublishState() {
 	mqttPublish(mqttTopic(prefix, "snapshots/state"), snapState, true)
 	mqttPublish(mqttTopic(prefix, "pushover/state"), pushState, true)
 	mqttPublish(mqttTopic(prefix, "vision/state"), visionState, true)
+	var llmState = "OFF"
+	if llmEnabled() {
+		llmState = "ON"
+	}
+	mqttPublish(mqttTopic(prefix, "llm/state"), llmState, true)
 	mqttPublish(mqttTopic(prefix, "status"), "online", true)
 }
 
@@ -277,7 +282,8 @@ func mqttDetectionPayload(d *Detection) string {
 	if d != nil {
 		visionExtra = `,"vision_count":` + strconv.Itoa(d.visionCount) +
 			`,"vision_top":` + jsonString(d.visionTop) +
-			`,"vision_error":` + jsonString(d.visionError)
+			`,"vision_error":` + jsonString(d.visionError) +
+			`,"llm_summary":` + jsonString(d.llmSummary)
 		if len(rel) > 0 && rel[len(rel)-1] == '}' {
 			rel = rel[:len(rel)-1] + visionExtra + "}"
 		}
@@ -365,6 +371,8 @@ func mqttOnConnect(c mqtt.Client) {
 		mqttTopic(prefix, "pushover/state/set"):  1,
 		mqttTopic(prefix, "vision/set"):          1,
 		mqttTopic(prefix, "vision/state/set"):    1,
+		mqttTopic(prefix, "llm/set"):             1,
+		mqttTopic(prefix, "llm/state/set"):       1,
 	}
 	for t, qos := range topics {
 		token := c.Subscribe(t, qos, mqttMessageHandler)
@@ -415,6 +423,9 @@ func mqttMessageHandler(c mqtt.Client, msg mqtt.Message) {
 	case "vision/set", "vision/state/set":
 		setVisionEnabled(val)
 		logIt(LINFO, "mqtt vision set", map[string]string{"enabled": boolJSON(val), "topic": topic})
+	case "llm/set", "llm/state/set":
+		setLLMEnabled(val)
+		logIt(LINFO, "mqtt llm set", map[string]string{"enabled": boolJSON(val), "topic": topic})
 	case "snapshots/set", "snapshots/state/set":
 		setSnapshotsEnabled(val)
 		logIt(LINFO, "mqtt snapshots set", map[string]string{"enabled": boolJSON(val), "topic": topic})
@@ -454,6 +465,7 @@ func mqttPublishHassDiscovery() {
 		{"snapshots", "Snapshots"},
 		{"pushover", "Push Notification"},
 		{"vision", "Vision Analysis"},
+		{"llm", "LLM Description"},
 	} {
 		discoveryTopic := fmt.Sprintf("homeassistant/switch/%s_%s/config", prefix, ent.id)
 		uniqueID := fmt.Sprintf("%s_%s", prefix, ent.id)

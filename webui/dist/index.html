@@ -16,6 +16,7 @@
     <button id="s3Toggle" class="det-on" hidden>S3: ON</button>
     <button id="pushToggle" class="det-on" hidden>Push: ON</button>
     <button id="visionToggle" class="det-on" hidden>Vision: OFF</button>
+    <button id="llmToggle" class="det-on" hidden title="Vision-LLM description of detections">LLM: OFF</button>
   </header>
 
   <div class="app-layout">
@@ -73,6 +74,8 @@
       <section id="detail" hidden>
         <h2 id="dtitle"></h2>
         <button id="delDetail" class="del-btn">Delete</button>
+        <div id="ddl" class="dl-bar"></div>
+        <div id="dllm" class="llm-panel" hidden></div>
         <div id="dsnaps"></div>
         <video id="dclip" controls></video>
         <div id="dmeta"></div>

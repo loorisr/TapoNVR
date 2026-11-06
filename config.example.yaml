@@ -161,6 +161,46 @@ vision:
   # Max concurrent /v1/detect calls (1..8, keeps the ORT pool responsive).
   max_workers: 2
 
+# Optional vision-LLM description of each detection: the snapshots and/or
+# keyframes sampled from the clip are sent to a multimodal model, which writes a
+# short summary ("a person drops a parcel at the door, then leaves"). Shown in
+# the WebUI, added to the MQTT detection payload (llm_summary). Off by default.
+# Every analysis is one API request: with a paid API, restrict `events` (e.g.
+# [person, vehicle]) or set auto: false and analyze on demand from the WebUI.
+llm:
+  enabled: false
+  # anthropic: Claude through the official SDK (needs an API key).
+  # openai:    any OpenAI-compatible server, e.g. a local Ollama / LM Studio /
+  #            vLLM / llama.cpp, or OpenRouter / OpenAI (set url + model).
+  provider: anthropic
+  # anthropic: optional base URL override (empty = official endpoint).
+  # openai: required, e.g. http://127.0.0.1:11434/v1 (Ollama).
+  url: ""
+  # anthropic: empty falls back to the ANTHROPIC_API_KEY environment variable.
+  # openai: optional (local servers usually need none).
+  api_key: ""
+  # anthropic default: claude-opus-5-5. openai: e.g. qwen2.5vl:7b, gemma3:12b.
+  model: claude-opus-5-5
+  # anthropic only: low|medium|high|xhigh|max (low suits short descriptions).
+  effort: low
+  # What is analyzed: snapshots | video (keyframes from the clip) | both.
+  # Falls back to the other kind when the detection has none.
+  source: snapshots
+  # Max images per request (1..20) and their long edge in pixels (256..2048).
+  max_images: 6
+  image_max_px: 1024
+  # Per-request timeout (10..600 s) and answer length cap.
+  timeout_s: 120
+  max_tokens: 16000
+  # Answer language (empty = English), e.g. French.
+  language: ""
+  # Replace the built-in instructions (camera/time/tags are still provided).
+  prompt: ""
+  # Analyze every new detection once its media is ready (false = on demand).
+  auto: true
+  # Restrict automatic analysis to these types (empty = all).
+  events: []
+
 # Where detections come from.
 #   onvif (default): the camera POSTs ONVIF motion/person/vehicle/pet events to
 #                    the webhook. Gives the type but NOT the bounding box.
