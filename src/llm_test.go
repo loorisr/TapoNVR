@@ -466,6 +466,39 @@ func TestDetectionLLMEndpoint(t *testing.T) {
 	}
 }
 
+// The backup descriptor is meant to be shared: it must not carry the LLM
+// credentials, and redacting them must not break the running config.
+func TestBackupRedactsLLMCredentials(t *testing.T) {
+	cfg := Config{}
+	configDefaults(&cfg)
+	cfg.Server.DataDir = t.TempDir()
+	cfg.LLM.APIKey = "sk-llm-secret"
+	cfg.LLM.URL = "https://proxyuser:proxypass@llm.example/v1"
+	app := &App{cfg: &cfg, db: testDB(t)}
+	rec := httptest.NewRecorder()
+	handleSystemBackup(app, rec, httptest.NewRequest("GET", "/api/system/backup", nil))
+	if rec.Code != 200 {
+		t.Fatalf("backup: %d %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Config struct {
+			LLM struct{ APIKey, URL string }
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Config.LLM.APIKey != "***" {
+		t.Errorf("llm api key not redacted: %q", out.Config.LLM.APIKey)
+	}
+	if out.Config.LLM.URL != "https://***@llm.example/v1" {
+		t.Errorf("llm url credentials not redacted: %q", out.Config.LLM.URL)
+	}
+	if cfg.LLM.APIKey != "sk-llm-secret" || !strings.Contains(cfg.LLM.URL, "proxypass") {
+		t.Errorf("backup modified the live config: %+v", cfg.LLM)
+	}
+}
+
 func zipReader(b []byte) (*zip.Reader, error) {
 	return zip.NewReader(bytes.NewReader(b), int64(len(b)))
 }

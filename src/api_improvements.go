@@ -44,6 +44,8 @@ func handleSystemBackup(app *App, w http.ResponseWriter, r *http.Request) {
 		cp.Alerts.Pushover.AppToken = "***"
 		cp.Alerts.Pushover.UserKey = "***"
 		cp.Vision.APIKey = "***"
+		cp.LLM.APIKey = "***"
+		cp.LLM.URL = redactRTSPUserInfo(cp.LLM.URL)
 		cp.Mqtt.Password = "***"
 		for i := range cp.Cameras {
 			cp.Cameras[i].Onvif.Password = "***"
