@@ -310,7 +310,11 @@ func llmAnalyzeAndStore(app *App, id string, source string) {
 	out, aerr := llmAnalyzeDetection(app, d, source)
 	var now = time.Now().Unix()
 	if aerr != nil {
-		llmNoteResult(false)
+		// No API call happened without an image: that says nothing about the
+		// API, so it neither starts nor lifts the pause for the other cameras.
+		if !errors.Is(aerr, errLLMNoImage) {
+			llmNoteResult(false)
+		}
 		_ = dbSetLLMError(app.db, id, source, aerr.Error(), now)
 		logIt(LWARN, "llm analysis failed", map[string]string{"id": id, "error": truncateForLog(aerr.Error(), 300)})
 		broadcastLLM(d, false)
@@ -337,12 +341,15 @@ func broadcastLLM(d *Detection, ok bool) {
 	hub.broadcast(body)
 }
 
+// errLLMNoImage reports a detection with nothing to send to the model.
+var errLLMNoImage = errors.New("no image to analyze (snapshot/clip missing)")
+
 // llmAnalyzeDetection gathers the images for source and asks the model.
 func llmAnalyzeDetection(app *App, d *Detection, source string) (*llmOutcome, error) {
 	var cfg = app.cfg.LLM
 	images, used := llmCollectImages(app, d, source, cfg.MaxImages, cfg.ImageMaxPx)
 	if len(images) == 0 {
-		return nil, fmt.Errorf("no image to analyze (snapshot/clip missing)")
+		return nil, errLLMNoImage
 	}
 	var system = llmSystemPrompt(cfg)
 	var question = llmContextText(d, used, len(images))

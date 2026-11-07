@@ -466,6 +466,85 @@ func TestDetectionLLMEndpoint(t *testing.T) {
 	}
 }
 
+// llmBackoffFixture builds an app whose LLM API always answers 500, plus one
+// row with a real snapshot and one with only the NO SIGNAL placeholder.
+func llmBackoffFixture(t *testing.T) (app *App, healthyID, offlineID string, calls func() int) {
+	t.Helper()
+	llmNoteResult(true)
+	t.Cleanup(func() { llmNoteResult(true) })
+	var mu sync.Mutex
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		w.WriteHeader(500)
+	}))
+	t.Cleanup(srv.Close)
+	store := testDB(t)
+	dir := t.TempDir()
+	cfg := Config{}
+	configDefaults(&cfg)
+	cfg.Server.DataDir = dir
+	cfg.LLM.Provider, cfg.LLM.URL, cfg.LLM.Model = "openai", srv.URL, "test-model"
+	app = &App{cfg: &cfg, db: store}
+	insert := func(name string, write func(path string) error) string {
+		path := filepath.Join(dir, name)
+		if err := write(path); err != nil {
+			t.Fatal(err)
+		}
+		d := Detection{id: newID(), cameraID: "cam0", camName: "c", detType: "person", snapshotPath: path}
+		if err := dbInsertDetection(store, &d); err != nil {
+			t.Fatal(err)
+		}
+		return d.id
+	}
+	healthyID = insert("good.jpg", func(p string) error { writeTestJPEG(t, p); return nil })
+	offlineID = insert("placeholder.jpg", writePlaceholderJpg)
+	return app, healthyID, offlineID, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+}
+
+// A detection without a usable image (camera offline, media deleted) says
+// nothing about the API: it must not pause the analyses of the other cameras.
+func TestLLMMissingImageDoesNotPauseAnalyses(t *testing.T) {
+	app, _, offlineID, calls := llmBackoffFixture(t)
+	llmAnalyzeAndStore(app, offlineID, "snapshots")
+	if llmBackoffActive() {
+		t.Error("a detection without image activated the API failure backoff")
+	}
+	if calls() != 0 {
+		t.Errorf("API called %d times without any image", calls())
+	}
+	got, err := getDetection(app.db, offlineID)
+	if err != nil || got == nil {
+		t.Fatalf("row: %v %v", got, err)
+	}
+	if !strings.Contains(got.llmError, "no image") {
+		t.Errorf("failure not recorded on the row: %q", got.llmError)
+	}
+}
+
+// A failing API still pauses automatic analyses, and a detection without image
+// arriving meanwhile must not lift that pause (no API call proves it recovered).
+func TestLLMAPIFailureStillPausesAnalyses(t *testing.T) {
+	app, healthyID, offlineID, calls := llmBackoffFixture(t)
+	llmAnalyzeAndStore(app, healthyID, "snapshots")
+	if calls() != 1 {
+		t.Fatalf("expected 1 API call, got %d", calls())
+	}
+	if !llmBackoffActive() {
+		t.Fatal("API failure did not activate the backoff")
+	}
+	llmAnalyzeAndStore(app, offlineID, "snapshots")
+	if !llmBackoffActive() {
+		t.Error("a detection without image lifted the API failure backoff")
+	}
+}
+
 // The backup descriptor is meant to be shared: it must not carry the LLM
 // credentials, and redacting them must not break the running config.
 func TestBackupRedactsLLMCredentials(t *testing.T) {
