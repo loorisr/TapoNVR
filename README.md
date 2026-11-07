@@ -73,7 +73,7 @@ YAML file.
 - Live bounding-box overlay and a detection timeline.
 - Optional YOLO sidecar analysis for snapshots.
 - Optional vision-LLM description of each detection (snapshots and/or clip
-  keyframes) with Claude or any OpenAI-compatible local model (Ollama, …).
+  keyframes) with any OpenAI-compatible API (Ollama, LM Studio, vLLM, …).
 
 **Integrations and operations**
 - Local storage plus S3-compatible upload (MinIO, Cloudflare R2, …).
@@ -645,8 +645,7 @@ After running, review with `git diff --stat` and rebuild via
   clip are done, runs one request at a time, and pauses for 30 s to 15 min
   after repeated API failures (on-demand requests always run). With a paid
   API every analyzed detection costs one request: use `llm.events` or
-  `llm.auto: false` to keep it in check. The Claude SDK adds about 5 MB to the
-  binary.
+  `llm.auto: false` to keep it in check.
 - **Detection types are camera-defined.** ONVIF/RTSP are used for detection and
   (ONVIF) PTZ control; detection types are whatever the camera emits (motion /
   person / vehicle / pet / other).

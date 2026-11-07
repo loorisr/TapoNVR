@@ -169,20 +169,14 @@ vision:
 # [person, vehicle]) or set auto: false and analyze on demand from the WebUI.
 llm:
   enabled: false
-  # anthropic: Claude through the official SDK (needs an API key).
-  # openai:    any OpenAI-compatible server, e.g. a local Ollama / LM Studio /
-  #            vLLM / llama.cpp, or OpenRouter / OpenAI (set url + model).
-  provider: anthropic
-  # anthropic: optional base URL override (empty = official endpoint).
-  # openai: required, e.g. http://127.0.0.1:11434/v1 (Ollama).
+  # Required: base URL of any OpenAI-compatible server (Ollama, LM Studio, vLLM,
+  # llama.cpp, OpenRouter, OpenAI...), e.g. http://192.168.1.10:11434/v1 (Ollama).
+  # In Docker, 127.0.0.1 is the container itself: use the server's LAN address.
   url: ""
-  # anthropic: empty falls back to the ANTHROPIC_API_KEY environment variable.
-  # openai: optional (local servers usually need none).
+  # Optional (local servers usually need none).
   api_key: ""
-  # anthropic default: claude-opus-5-5. openai: e.g. qwen2.5vl:7b, gemma3:12b.
-  model: claude-opus-5-5
-  # anthropic only: low|medium|high|xhigh|max (low suits short descriptions).
-  effort: low
+  # Required: a vision-capable model, e.g. qwen2.5vl:7b, gemma3:12b.
+  model: ""
   # What is analyzed: snapshots | video (keyframes from the clip) | both.
   # Falls back to the other kind when the detection has none.
   source: snapshots
@@ -191,7 +185,7 @@ llm:
   image_max_px: 1024
   # Per-request timeout (10..600 s) and answer length cap.
   timeout_s: 120
-  max_tokens: 16000
+  max_tokens: 2048
   # Answer language (empty = English), e.g. French.
   language: ""
   # Replace the built-in instructions (camera/time/tags are still provided).

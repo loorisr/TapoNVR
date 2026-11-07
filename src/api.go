@@ -2540,7 +2540,6 @@ func handleSystemStatus(app *App, w http.ResponseWriter, r *http.Request) {
 		`,"vision_avg_ms":` + fmt.Sprintf("%.1f", visionAvgMs) +
 		`,"vision_avg_total_ms":` + fmt.Sprintf("%.1f", visionAvgTotalMs) +
 		"," + kvRaw("llm_enabled", boolJSON(llmEnabled())) +
-		"," + kv("llm_provider", app.cfg.LLM.Provider) +
 		"," + kv("llm_model", app.cfg.LLM.Model) +
 		"," + kv("record_mode", app.cfg.Record.Mode) +
 		"," + kv("detection_source", app.cfg.Detection.Source) +

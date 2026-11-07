@@ -298,22 +298,15 @@ type VisionCfg struct {
 type LLMCfg struct {
 	// Enabled master switch (also flippable at runtime via /api/llm/state).
 	Enabled bool `yaml:"enabled"`
-	// Provider is "anthropic" (Claude, official SDK) or "openai" (any
-	// OpenAI-compatible chat completions API: Ollama, LM Studio, vLLM,
-	// llama.cpp server, OpenRouter, OpenAI...).
-	Provider string `yaml:"provider"`
-	// URL is the API base URL. anthropic: optional override (empty = the
-	// official endpoint). openai: required, e.g. http://127.0.0.1:11434/v1.
+	// URL is the base URL of an OpenAI-compatible chat completions API
+	// (Ollama, LM Studio, vLLM, llama.cpp server, OpenRouter, OpenAI...),
+	// e.g. http://127.0.0.1:11434/v1. Required.
 	URL string `yaml:"url"`
-	// APIKey authenticates the requests. anthropic: empty falls back to the
-	// ANTHROPIC_API_KEY environment variable. openai: optional (local
-	// servers usually need none).
+	// APIKey authenticates the requests. Optional (local servers usually
+	// need none).
 	APIKey string `yaml:"api_key"`
-	// Model is the model id (anthropic default claude-opus-5-5; openai e.g.
-	// qwen2.5vl:7b, llava, gpt-4o).
+	// Model is the model id, e.g. qwen2.5vl:7b, llava, gpt-4o. Required.
 	Model string `yaml:"model"`
-	// Effort (anthropic only): low|medium|high|xhigh|max.
-	Effort string `yaml:"effort"`
 	// Source selects what is analyzed: snapshots, video (keyframes sampled
 	// from the clip) or both.
 	Source string `yaml:"source"`
@@ -578,14 +571,11 @@ func configDefaults(c *Config) {
 	c.Vision.Snapshots = "primary"
 	c.Vision.MaxWorkers = 2
 	c.LLM.Enabled = false
-	c.LLM.Provider = "anthropic"
-	c.LLM.Model = "claude-opus-5-5"
-	c.LLM.Effort = "low"
 	c.LLM.Source = "snapshots"
 	c.LLM.MaxImages = 6
 	c.LLM.ImageMaxPx = 1024
 	c.LLM.TimeoutS = 120
-	c.LLM.MaxTokens = 16000
+	c.LLM.MaxTokens = 2048
 	c.LLM.Auto = true
 	c.Detection.Source = "onvif"
 	c.Detection.RTSP.Transport = "tcp"
@@ -908,34 +898,13 @@ func loadConfig(path string) (*Config, error) {
 // clampLLMConfig normalizes the llm section: unknown enum values fall back to
 // their defaults and numeric fields are clamped to safe ranges.
 func clampLLMConfig(l *LLMCfg) {
-	switch strings.ToLower(strings.TrimSpace(l.Provider)) {
-	case "", "anthropic", "claude":
-		l.Provider = "anthropic"
-	case "openai", "openai-compatible", "ollama":
-		l.Provider = "openai"
-	default:
-		configWarn("config clamped: llm.provider must be anthropic|openai, using anthropic", map[string]string{"value": l.Provider})
-		l.Provider = "anthropic"
-	}
 	l.Model = strings.TrimSpace(l.Model)
-	if l.Model == "" && l.Provider == "anthropic" {
-		l.Model = "claude-opus-5-5"
-	}
 	if l.Enabled && l.Model == "" {
-		configWarn("config: llm.model is empty (required for provider openai)", nil)
+		configWarn("config: llm.model is empty (required)", nil)
 	}
 	l.URL = strings.TrimSuffix(strings.TrimSpace(l.URL), "/")
-	if l.Enabled && l.Provider == "openai" && l.URL == "" {
-		configWarn("config: llm.url is empty (required for provider openai, e.g. http://127.0.0.1:11434/v1)", nil)
-	}
-	switch strings.ToLower(strings.TrimSpace(l.Effort)) {
-	case "low", "medium", "high", "xhigh", "max":
-		l.Effort = strings.ToLower(strings.TrimSpace(l.Effort))
-	case "":
-		l.Effort = "low"
-	default:
-		configWarn("config clamped: llm.effort must be low|medium|high|xhigh|max, using low", map[string]string{"value": l.Effort})
-		l.Effort = "low"
+	if l.Enabled && l.URL == "" {
+		configWarn("config: llm.url is empty (required, e.g. http://127.0.0.1:11434/v1)", nil)
 	}
 	switch strings.ToLower(strings.TrimSpace(l.Source)) {
 	case "", "snapshots", "snapshot", "images":
@@ -961,8 +930,8 @@ func clampLLMConfig(l *LLMCfg) {
 		l.TimeoutS = 120
 	}
 	if l.MaxTokens < 256 || l.MaxTokens > 64000 {
-		configWarn("config clamped: llm.max_tokens not in 256..64000, using 16000", nil)
-		l.MaxTokens = 16000
+		configWarn("config clamped: llm.max_tokens not in 256..64000, using 2048", nil)
+		l.MaxTokens = 2048
 	}
 	var events []string
 	for _, e := range l.Events {

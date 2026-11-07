@@ -16,16 +16,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/anthropics/anthropic-sdk-go/v2"
-	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
 
 // ---------------- llm: vision-LLM description of detections --------------
 // Snapshots and/or keyframes sampled from the clip are sent to a multimodal
-// model (Claude through the official SDK, or any OpenAI-compatible server
-// such as Ollama), which returns a short natural-language description stored
-// on the detection row. Disabled by default; always async: it never delays
+// model behind an OpenAI-compatible API (such as Ollama), which returns a
+// short natural-language description stored on the detection row. Disabled by
+// default; always async: it never delays
 // the webhook, the snapshot chain, the clip or the alerts.
 
 // llmImage is one image sent to the model, with the caption that precedes it.
@@ -355,13 +352,7 @@ func llmAnalyzeDetection(app *App, d *Detection, source string) (*llmOutcome, er
 	var question = llmContextText(d, used, len(images))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.TimeoutS)*time.Second)
 	defer cancel()
-	var text, model string
-	var err error
-	if cfg.Provider == "openai" {
-		text, model, err = llmCallOpenAI(ctx, cfg, system, images, question)
-	} else {
-		text, model, err = llmCallAnthropic(ctx, cfg, system, images, question)
-	}
+	text, model, err := llmCallOpenAI(ctx, cfg, system, images, question)
 	if err != nil {
 		return nil, err
 	}
@@ -524,107 +515,7 @@ func llmContextText(d *Detection, used string, n int) string {
 	return b.String()
 }
 
-// ---------------- provider: Claude (official SDK) ---------------------------
-
-var llmClaudeMtx sync.Mutex
-var llmClaudeClient *anthropic.Client
-var llmClaudeKey string
-
-// llmClaude returns a client for the current config (rebuilt when the key,
-// URL or timeout change). An empty api_key lets the SDK read
-// ANTHROPIC_API_KEY from the environment.
-func llmClaude(cfg LLMCfg) *anthropic.Client {
-	var key = cfg.APIKey + "|" + cfg.URL + "|" + strconv.Itoa(cfg.TimeoutS)
-	llmClaudeMtx.Lock()
-	defer llmClaudeMtx.Unlock()
-	if llmClaudeClient != nil && llmClaudeKey == key {
-		return llmClaudeClient
-	}
-	var opts = []option.RequestOption{
-		option.WithRequestTimeout(time.Duration(cfg.TimeoutS) * time.Second),
-		option.WithMaxRetries(2),
-	}
-	if k := strings.TrimSpace(cfg.APIKey); k != "" {
-		opts = append(opts, option.WithAPIKey(k))
-	}
-	if u := strings.TrimSpace(cfg.URL); u != "" {
-		opts = append(opts, option.WithBaseURL(u))
-	}
-	var c = anthropic.NewClient(opts...)
-	llmClaudeClient = &c
-	llmClaudeKey = key
-	return llmClaudeClient
-}
-
-// llmCallAnthropic sends the images to Claude and returns the text answer and
-// the model that served it. A policy refusal on the requested model is
-// re-served server-side by its default fallback model.
-func llmCallAnthropic(ctx context.Context, cfg LLMCfg, system string, images []llmImage, question string) (string, string, error) {
-	var content []anthropic.BetaContentBlockParamUnion
-	for _, im := range images {
-		content = append(content,
-			anthropic.NewBetaTextBlock(im.label),
-			anthropic.NewBetaImageBlock(anthropic.BetaBase64ImageSourceParam{
-				Data:      base64.StdEncoding.EncodeToString(im.jpeg),
-				MediaType: anthropic.BetaBase64ImageSourceMediaTypeImageJPEG,
-			}),
-		)
-	}
-	content = append(content, anthropic.NewBetaTextBlock(question))
-	var params = anthropic.BetaMessageNewParams{
-		Model:     anthropic.Model(cfg.Model),
-		MaxTokens: int64(cfg.MaxTokens),
-		System:    []anthropic.BetaTextBlockParam{{Text: system}},
-		Messages:  []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(content...)},
-		OutputConfig: anthropic.BetaOutputConfigParam{
-			Effort: anthropic.BetaOutputConfigEffort(cfg.Effort),
-		},
-		Betas:     []anthropic.AnthropicBeta{anthropic.AnthropicBetaServerSideFallback2026_07_01},
-		Fallbacks: anthropic.BetaFallbacksParamUnion{OfDefault: "default"},
-	}
-	resp, err := llmClaude(cfg).Beta.Messages.New(ctx, params)
-	if err != nil {
-		var apierr *anthropic.Error
-		if errors.As(err, &apierr) {
-			switch apierr.StatusCode {
-			case 401, 403:
-				return "", "", fmt.Errorf("claude api %d: unauthorized (check llm.api_key or ANTHROPIC_API_KEY)", apierr.StatusCode)
-			case 404:
-				return "", "", fmt.Errorf("claude api 404: unknown model %q", cfg.Model)
-			case 413:
-				return "", "", fmt.Errorf("claude api 413: request too large (lower llm.max_images or llm.image_max_px)")
-			case 429:
-				return "", "", fmt.Errorf("claude api 429: rate limited")
-			default:
-				var msg = apierr.Message
-				if msg == "" {
-					msg = http.StatusText(apierr.StatusCode)
-				}
-				return "", "", fmt.Errorf("claude api %d: %s", apierr.StatusCode, msg)
-			}
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("claude api timeout after %ds", cfg.TimeoutS)
-		}
-		return "", "", err
-	}
-	if resp.StopReason == anthropic.BetaStopReasonRefusal {
-		var cat = string(resp.StopDetails.Category)
-		if cat == "" {
-			cat = "unspecified"
-		}
-		return "", string(resp.Model), fmt.Errorf("model declined the request (category %s)", cat)
-	}
-	var parts []string
-	for _, block := range resp.Content {
-		if tb, ok := block.AsAny().(anthropic.BetaTextBlock); ok && strings.TrimSpace(tb.Text) != "" {
-			parts = append(parts, strings.TrimSpace(tb.Text))
-		}
-	}
-	return strings.Join(parts, "\n"), string(resp.Model), nil
-}
-
-// ---------------- provider: OpenAI-compatible (Ollama, LM Studio...) --------
+// ---------------- API call: OpenAI-compatible (Ollama, LM Studio...) --------
 
 // llmCallOpenAI posts a chat completion with inline data-URL images to an
 // OpenAI-compatible server (POST {url}/chat/completions).
@@ -780,7 +671,7 @@ func llmJSON(d *Detection) string {
 func llmStatusJSON(app *App) string {
 	var c = app.cfg.LLM
 	q, w, dropped := llmStats()
-	return `"llm":{` + kvRaw("enabled", boolJSON(llmEnabled())) + "," + kv("provider", c.Provider) + "," +
+	return `"llm":{` + kvRaw("enabled", boolJSON(llmEnabled())) + "," +
 		kv("model", c.Model) + "," + kv("source", c.Source) + "," + kvRaw("auto", boolJSON(c.Auto)) + "," +
 		`"queued":` + strconv.Itoa(q) + `,"waiting":` + strconv.Itoa(w) + `,"dropped":` + strconv.FormatInt(dropped, 10) + "," +
 		kvRaw("backoff", boolJSON(llmBackoffActive())) + "}"

@@ -111,10 +111,7 @@ func run(args []string) int {
 	setPushoverEnabled(cfg.Alerts.Pushover.Enabled)
 	initVision(&cfg.Vision, cfg.Vision.Enabled)
 	setLLMEnabled(cfg.LLM.Enabled)
-	if cfg.LLM.Enabled && cfg.LLM.Provider == "anthropic" && cfg.LLM.APIKey == "" && os.Getenv("ANTHROPIC_API_KEY") == "" {
-		logIt(LWARN, "llm enabled with provider anthropic but no api key (llm.api_key or ANTHROPIC_API_KEY); analyses will fail", nil)
-	}
-	if cfg.LLM.Enabled && cfg.LLM.Provider == "openai" && cfg.LLM.APIKey != "" && strings.HasPrefix(strings.ToLower(cfg.LLM.URL), "http://") {
+	if cfg.LLM.Enabled && cfg.LLM.APIKey != "" && strings.HasPrefix(strings.ToLower(cfg.LLM.URL), "http://") {
 		logIt(LWARN, "llm api_key sent over plain HTTP; use https or an isolated LAN", nil)
 	}
 	// detection defaults to enabled; no config field yet

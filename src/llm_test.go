@@ -150,80 +150,6 @@ func TestExtractClipKeyframesMP4AndTS(t *testing.T) {
 
 // ---------------- providers -----------------------------------------------------
 
-func TestLLMCallAnthropicRequestShape(t *testing.T) {
-	var got map[string]any
-	var beta, apiKey string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/v1/messages") {
-			http.NotFound(w, r)
-			return
-		}
-		beta = r.Header.Get("anthropic-beta")
-		apiKey = r.Header.Get("x-api-key") + r.Header.Get("Authorization")
-		body, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(body, &got)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"A person walks to the front door."}],"stop_reason":"end_turn","stop_details":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":8}}`)
-	}))
-	defer srv.Close()
-	cfg := Config{}
-	configDefaults(&cfg)
-	cfg.LLM.URL = srv.URL
-	cfg.LLM.APIKey = "test-key"
-	imgs := []llmImage{{label: "Snapshot 1", jpeg: []byte{0xff, 0xd8, 0xff, 0xd9}}}
-	text, model, err := llmCallAnthropic(t.Context(), cfg.LLM, "sys", imgs, "Describe.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if text != "A person walks to the front door." || model != "claude-opus-5-5" {
-		t.Fatalf("got %q / %q", text, model)
-	}
-	if !strings.Contains(apiKey, "test-key") || !strings.Contains(beta, "server-side-fallback-2026-07-01") {
-		t.Fatalf("headers: key=%q beta=%q", apiKey, beta)
-	}
-	if got["model"] != "claude-opus-5-5" || got["fallbacks"] != "default" {
-		t.Fatalf("model/fallbacks: %v / %v", got["model"], got["fallbacks"])
-	}
-	if oc, _ := got["output_config"].(map[string]any); oc["effort"] != "low" {
-		t.Fatalf("effort not sent: %v", got["output_config"])
-	}
-	if _, has := got["thinking"]; has {
-		t.Fatal("thinking must be omitted (always on for this model)")
-	}
-	msgs, _ := got["messages"].([]any)
-	content := msgs[0].(map[string]any)["content"].([]any)
-	if len(content) != 3 || content[1].(map[string]any)["type"] != "image" {
-		t.Fatalf("content blocks: %v", content)
-	}
-	src := content[1].(map[string]any)["source"].(map[string]any)
-	if src["media_type"] != "image/jpeg" || src["type"] != "base64" || src["data"] == "" {
-		t.Fatalf("image source: %v", src)
-	}
-}
-
-func TestLLMCallAnthropicRefusalAndErrors(t *testing.T) {
-	var status = 200
-	var body = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"x"},"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}`
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = io.WriteString(w, body)
-	}))
-	defer srv.Close()
-	cfg := Config{}
-	configDefaults(&cfg)
-	cfg.LLM.URL = srv.URL
-	cfg.LLM.APIKey = "k"
-	imgs := []llmImage{{label: "x", jpeg: []byte{1}}}
-	if _, _, err := llmCallAnthropic(t.Context(), cfg.LLM, "s", imgs, "q"); err == nil || !strings.Contains(err.Error(), "declined") {
-		t.Fatalf("refusal not reported: %v", err)
-	}
-	status, body = 401, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`
-	if _, _, err := llmCallAnthropic(t.Context(), cfg.LLM, "s", imgs, "q"); err == nil || !strings.Contains(err.Error(), "unauthorized") {
-		t.Fatalf("401 not mapped: %v", err)
-	}
-}
-
 func TestLLMCallOpenAICompatible(t *testing.T) {
 	var got map[string]any
 	var auth string
@@ -238,7 +164,7 @@ func TestLLMCallOpenAICompatible(t *testing.T) {
 		_, _ = io.WriteString(w, `{"model":"qwen2.5vl:7b","choices":[{"message":{"role":"assistant","content":"A cat crosses the yard."},"finish_reason":"stop"}]}`)
 	}))
 	defer srv.Close()
-	cfg := LLMCfg{Provider: "openai", URL: srv.URL + "/v1", Model: "qwen2.5vl:7b", MaxTokens: 500, APIKey: "sk-local"}
+	cfg := LLMCfg{URL: srv.URL + "/v1", Model: "qwen2.5vl:7b", MaxTokens: 500, APIKey: "sk-local"}
 	text, model, err := llmCallOpenAI(t.Context(), cfg, "sys", []llmImage{{label: "Snapshot 1", jpeg: []byte{0xff, 0xd8}}}, "Describe.")
 	if err != nil {
 		t.Fatal(err)
@@ -309,13 +235,13 @@ func TestLLMTrackWaitsForAllProducers(t *testing.T) {
 		calls++
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"m","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Nothing of interest: the scene is empty."}],"stop_reason":"end_turn","stop_details":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`)
+		_, _ = io.WriteString(w, `{"model":"test-model","choices":[{"message":{"role":"assistant","content":"Nothing of interest: the scene is empty."},"finish_reason":"stop"}]}`)
 	}))
 	defer srv.Close()
 	cfg := Config{}
 	configDefaults(&cfg)
 	cfg.Server.DataDir = dir
-	cfg.LLM.Enabled, cfg.LLM.URL, cfg.LLM.APIKey = true, srv.URL, "k"
+	cfg.LLM.Enabled, cfg.LLM.URL, cfg.LLM.Model = true, srv.URL, "test-model"
 	app := &App{cfg: &cfg, db: store}
 	setLLMEnabled(true)
 	defer setLLMEnabled(false)
@@ -343,7 +269,7 @@ func TestLLMTrackWaitsForAllProducers(t *testing.T) {
 	for {
 		got, _ := getDetection(store, d.id)
 		if got != nil && got.llmSummary != "" {
-			if got.llmModel != "claude-opus-5-5" || got.llmSource != "snapshots" || got.llmImages != 1 || got.llmError != "" {
+			if got.llmModel != "test-model" || got.llmSource != "snapshots" || got.llmImages != 1 || got.llmError != "" {
 				t.Fatalf("stored result: %+v", got)
 			}
 			if !strings.Contains(detJSON(got), `"summary":"Nothing of interest`) {
@@ -364,9 +290,9 @@ func TestLLMTrackWaitsForAllProducers(t *testing.T) {
 }
 
 func TestLLMEventsFilterAndConfigClamp(t *testing.T) {
-	c := LLMCfg{Provider: "Ollama", Source: "clip", Effort: "bogus", MaxImages: 99, Events: []string{"Person", "nope", "person"}}
+	c := LLMCfg{Source: "clip", MaxImages: 99, Events: []string{"Person", "nope", "person"}}
 	clampLLMConfig(&c)
-	if c.Provider != "openai" || c.Source != "video" || c.Effort != "low" || c.MaxImages != 6 || len(c.Events) != 1 || c.Events[0] != "person" {
+	if c.Source != "video" || c.MaxImages != 6 || len(c.Events) != 1 || c.Events[0] != "person" {
 		t.Fatalf("clamp: %+v", c)
 	}
 	if llmEventAllowed(c, &Detection{detType: "motion", detTypes: "motion"}) {
@@ -377,7 +303,7 @@ func TestLLMEventsFilterAndConfigClamp(t *testing.T) {
 	}
 	var def Config
 	configDefaults(&def)
-	if def.LLM.Model != "claude-opus-5-5" || def.LLM.Provider != "anthropic" || def.LLM.Enabled {
+	if def.LLM.Model != "" || def.LLM.URL != "" || def.LLM.MaxTokens != 2048 || def.LLM.Enabled {
 		t.Fatalf("defaults: %+v", def.LLM)
 	}
 }
@@ -486,7 +412,7 @@ func llmBackoffFixture(t *testing.T) (app *App, healthyID, offlineID string, cal
 	cfg := Config{}
 	configDefaults(&cfg)
 	cfg.Server.DataDir = dir
-	cfg.LLM.Provider, cfg.LLM.URL, cfg.LLM.Model = "openai", srv.URL, "test-model"
+	cfg.LLM.URL, cfg.LLM.Model = srv.URL, "test-model"
 	app = &App{cfg: &cfg, db: store}
 	insert := func(name string, write func(path string) error) string {
 		path := filepath.Join(dir, name)

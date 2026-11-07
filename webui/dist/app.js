@@ -1030,7 +1030,7 @@ function refreshSystemStatus() {
       statCard("Recording", pill(st.recording_enabled === "true" || st.recording_enabled === true) + " <span class='meta'>" + esc(st.record_mode || "") + "</span>") +
       statCard("Snapshots", pill(st.snapshots_enabled === "true" || st.snapshots_enabled === true)) +
       statCard("Vision (YOLO)", visionStatusHTML(st, wk)) +
-      statCard("LLM description", pill(st.llm_enabled === "true" || st.llm_enabled === true) + (st.llm_model ? " <span class='meta'>" + esc(st.llm_provider || "") + " · " + esc(st.llm_model) + "</span>" : "")) +
+      statCard("LLM description", pill(st.llm_enabled === "true" || st.llm_enabled === true) + (st.llm_model ? " <span class='meta'>" + esc(st.llm_model) + "</span>" : "")) +
       statCard("Uptime", esc(fmtUptime(st.uptime))) +
       statCard("Retention", esc(st.retention_days) + " <span class='meta'>days</span>");
     var sbox = document.getElementById("sysStats");
