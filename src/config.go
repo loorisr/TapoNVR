@@ -446,7 +446,11 @@ func sourceHas(source, want string) bool {
 func camDetectionSource(cfg *Config, cam *CameraCfg) string {
 	var s = strings.ToLower(strings.TrimSpace(cfg.Detection.Source))
 	if cam != nil {
-		if o := strings.ToLower(strings.TrimSpace(cam.DetectionSource)); o != "" {
+		// The API can change it at runtime while webhooks read it.
+		camOverrideMtx.Lock()
+		var raw = cam.DetectionSource
+		camOverrideMtx.Unlock()
+		if o := strings.ToLower(strings.TrimSpace(raw)); o != "" {
 			s = o
 		}
 	}

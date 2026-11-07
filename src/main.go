@@ -137,6 +137,7 @@ func run(args []string) int {
 	startPruneLoop(&app)
 	startStream(&app)
 	buffersStart(&app)
+	rememberCamBootSources(&app)
 	onvifEventsStart(&app)
 	snapshotWarmupStart(&app)
 	detectionRTSPStart(&app)

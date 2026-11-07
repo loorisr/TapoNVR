@@ -896,6 +896,34 @@ func onvifEventLoop(app *App, cam *CameraCfg, camID string) {
 	}
 }
 
+// camBootSources holds each camera's detection source when the detectors were
+// started: the ONVIF pollers and RTSP readers only start at boot, so this is
+// what actually runs until the next restart, whatever the API set since.
+var camBootMtx sync.Mutex
+var camBootSources = map[string]string{}
+
+func rememberCamBootSources(app *App) {
+	camBootMtx.Lock()
+	defer camBootMtx.Unlock()
+	for i := range app.cfg.Cameras {
+		camBootSources[fmt.Sprintf("cam%d", i)] = camDetectionSource(app.cfg, &app.cfg.Cameras[i])
+	}
+}
+
+func camBootSource(camID string) (string, bool) {
+	camBootMtx.Lock()
+	defer camBootMtx.Unlock()
+	s, ok := camBootSources[camID]
+	return s, ok
+}
+
+// camSourceRestartRequired reports that the configured source differs from the
+// detectors actually running.
+func camSourceRestartRequired(cfg *Config, cam *CameraCfg, camID string) bool {
+	boot, ok := camBootSource(camID)
+	return ok && boot != camDetectionSource(cfg, cam)
+}
+
 // onvifEventsStart launches one event poller per enabled camera whose effective
 // detection source includes onvif.
 func onvifEventsStart(app *App) {
@@ -1305,11 +1333,19 @@ func handleOnvifNotify(app *App, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if idx >= 0 {
-		// A camera disabled (enabled:false) or moved off the ONVIF source
-		// can keep pushing until its old subscription expires on the camera
-		// side: ignore it, like the poller and recorder do.
+		// A camera disabled (enabled:false), set to off or moved off the ONVIF
+		// source can keep pushing until its old subscription expires on the
+		// camera side: ignore it. Exception: after a runtime switch away from
+		// ONVIF the poller still runs and the RTSP reader only starts at boot,
+		// so its events are kept until the restart that applies the change.
 		var c = &app.cfg.Cameras[idx]
-		if !c.Enabled || !sourceHas(camDetectionSource(app.cfg, c), "onvif") {
+		var cur = camDetectionSource(app.cfg, c)
+		var keep = c.Enabled && sourceHas(cur, "onvif")
+		if c.Enabled && !keep && cur != "off" {
+			boot, ok := camBootSource(fmt.Sprintf("cam%d", idx))
+			keep = ok && sourceHas(boot, "onvif")
+		}
+		if !keep {
 			idx = -1
 		}
 	}

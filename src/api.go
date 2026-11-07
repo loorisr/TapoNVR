@@ -2097,7 +2097,12 @@ func s3RetryLoop(app *App) {
 func s3RetryOne(app *App, d *Detection) bool {
 	var small []s3PutJob
 	if d.snapshotPath != "" {
-		small = append(small, s3PutJob{key: s3KeyForPath(d.snapshotPath), path: d.snapshotPath, contentType: "image/jpeg"})
+		// Deleted primary: not fatal, or the row would stay pending forever and
+		// its other files would be re-sent on every retry. Any other stat error
+		// may be transient, so the upload is still attempted (and fails).
+		if _, serr := os.Stat(d.snapshotPath); !errors.Is(serr, fs.ErrNotExist) {
+			small = append(small, s3PutJob{key: s3KeyForPath(d.snapshotPath), path: d.snapshotPath, contentType: "image/jpeg"})
+		}
 	}
 	if d.extraSnap != "" {
 		for _, p := range strings.Split(d.extraSnap, ",") {

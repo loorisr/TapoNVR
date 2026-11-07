@@ -399,7 +399,7 @@ from the event time).
 | `POST /api/test/detection` | Simulate an event end-to-end (dev/debug) |
 | `POST /api/cameras/{id}/snapshot` | Manual snapshot (uploaded to S3 when enabled, `manual/<cam>/` key) |
 | `POST /api/cameras/{id}/ptz` | PTZ move (only if available) |
-| `GET/POST /api/cameras/{id}/detection` | Per-camera tuning (`debounce_s` 0..3600, `hold_s` 1..60); GET prefills, POST saves; 404 when unsupported |
+| `GET/POST /api/cameras/{id}/detection` | Per-camera tuning (`debounce_s` 0..3600, `hold_s` 1..60, `source` onvif/rtsp/both/off); GET prefills, POST saves; 404 when unsupported. Detectors start at boot: `restart_required: true` means a source change is not fully applied until a restart (ONVIF webhook events keep being accepted meanwhile, except with `off`) |
 | `GET /api/manual/jobs/{id}` | Async legacy manual-record job status (`running`/`done`/`error` + `clip`); the UI polls it after a 202 `status_url` |
 
 ### Detections and media

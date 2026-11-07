@@ -162,7 +162,8 @@ func handleCameraDetection(app *App, w http.ResponseWriter, r *http.Request, pat
 			`,"debounce_s":` + strconv.Itoa(camDebounceS(app.cfg, cam)) +
 			`,"hold_s":` + strconv.Itoa(camHoldS(app.cfg, cam)) +
 			`,"debounce_inherit":` + boolJSON(cam.DetectionDebounceS == nil) +
-			`,"hold_inherit":` + boolJSON(cam.DetectionHoldS == nil) + "}"
+			`,"hold_inherit":` + boolJSON(cam.DetectionHoldS == nil) +
+			`,"restart_required":` + boolJSON(camSourceRestartRequired(app.cfg, cam, camID)) + "}"
 		writeJSON(w, 200, body)
 		return
 	}
@@ -184,7 +185,9 @@ func handleCameraDetection(app *App, w http.ResponseWriter, r *http.Request, pat
 		s := strings.ToLower(strings.TrimSpace(*body.Source))
 		switch s {
 		case "onvif", "rtsp", "both", "off":
+			camOverrideMtx.Lock()
 			cam.DetectionSource = s
+			camOverrideMtx.Unlock()
 		default:
 			writeJSON(w, 400, "{\"error\":\"source must be onvif|rtsp|both|off\"}")
 			return
@@ -210,6 +213,7 @@ func handleCameraDetection(app *App, w http.ResponseWriter, r *http.Request, pat
 	var out = "{" + kv("id", camID) +
 		"," + kv("source", camDetectionSource(app.cfg, cam)) +
 		`,"debounce_s":` + strconv.Itoa(camDebounceS(app.cfg, cam)) +
-		`,"hold_s":` + strconv.Itoa(camHoldS(app.cfg, cam)) + "}"
+		`,"hold_s":` + strconv.Itoa(camHoldS(app.cfg, cam)) +
+		`,"restart_required":` + boolJSON(camSourceRestartRequired(app.cfg, cam, camID)) + "}"
 	writeJSON(w, 200, out)
 }
