@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -37,6 +38,11 @@ func handleSystemBackup(app *App, w http.ResponseWriter, r *http.Request) {
 	var redacted = "(unavailable)"
 	if app != nil && app.cfg != nil {
 		cp := *app.cfg
+		// The struct copy shares the cameras backing array with the live
+		// config: redacting in place would overwrite the real ONVIF passwords
+		// and RTSP URLs (breaking PTZ, snapshots, event subscriptions and the
+		// next go2rtc config) after a single call.
+		cp.Cameras = slices.Clone(app.cfg.Cameras)
 		cp.Server.Auth.Password = "***"
 		cp.Server.OnvifNotifyToken = "***"
 		cp.Storage.S3.AccessKey = "***"
@@ -159,10 +165,10 @@ func handleCameraDetection(app *App, w http.ResponseWriter, r *http.Request, pat
 	if r.Method == "GET" {
 		var body = "{" + kv("id", camID) +
 			"," + kv("source", camDetectionSource(app.cfg, cam)) +
-			`,"debounce_s":` + strconv.Itoa(camDebounceS(app.cfg, cam)) +
-			`,"hold_s":` + strconv.Itoa(camHoldS(app.cfg, cam)) +
-			`,"debounce_inherit":` + boolJSON(cam.DetectionDebounceS == nil) +
-			`,"hold_inherit":` + boolJSON(cam.DetectionHoldS == nil) +
+			`,"debounce_s":` + strconv.Itoa(getCamDebounce(camID, camDebounceS(app.cfg, cam))) +
+			`,"hold_s":` + strconv.Itoa(getCamHold(camID, camHoldS(app.cfg, cam))) +
+			`,"debounce_inherit":` + boolJSON(cam.DetectionDebounceS == nil && !camDebounceOverridden(camID)) +
+			`,"hold_inherit":` + boolJSON(cam.DetectionHoldS == nil && !camHoldOverridden(camID)) +
 			`,"restart_required":` + boolJSON(camSourceRestartRequired(app.cfg, cam, camID)) + "}"
 		writeJSON(w, 200, body)
 		return
@@ -212,8 +218,8 @@ func handleCameraDetection(app *App, w http.ResponseWriter, r *http.Request, pat
 	logIt(LINFO, "camera detection tuning updated", map[string]string{"camera": cam.Name, "id": camID})
 	var out = "{" + kv("id", camID) +
 		"," + kv("source", camDetectionSource(app.cfg, cam)) +
-		`,"debounce_s":` + strconv.Itoa(camDebounceS(app.cfg, cam)) +
-		`,"hold_s":` + strconv.Itoa(camHoldS(app.cfg, cam)) +
+		`,"debounce_s":` + strconv.Itoa(getCamDebounce(camID, camDebounceS(app.cfg, cam))) +
+		`,"hold_s":` + strconv.Itoa(getCamHold(camID, camHoldS(app.cfg, cam))) +
 		`,"restart_required":` + boolJSON(camSourceRestartRequired(app.cfg, cam, camID)) + "}"
 	writeJSON(w, 200, out)
 }

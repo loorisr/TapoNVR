@@ -539,8 +539,57 @@ func initStreamProxy(app *App) {
 	streamProxy = streamProxyReverse(app)
 }
 
+// streamProxyAllowed reports whether a /stream/ request may be forwarded to
+// go2rtc. The proxy maps /stream/X onto go2rtc's /api/X, and that API is far
+// wider than what live view needs: /api/config and /api/streams return the
+// camera RTSP URLs with their passwords (which the NVR API deliberately never
+// exposes), and write methods can rewrite the go2rtc config, add arbitrary
+// sources or stop the relay. Only read-only playback endpoints are forwarded,
+// and only for configured cameras (go2rtc otherwise accepts an arbitrary URL
+// in ?src= and would connect to it).
+func streamProxyAllowed(r *http.Request) bool {
+	if r.Method != "GET" && r.Method != "HEAD" {
+		return false
+	}
+	var sub = strings.TrimPrefix(r.URL.Path, "/stream/")
+	switch sub {
+	case "ws", "stream.m3u8", "stream.mp4", "stream.mjpeg", "frame.jpeg", "frame.mp4":
+	default:
+		if !strings.HasPrefix(sub, "hls/") || strings.Contains(sub, "..") {
+			return false
+		}
+	}
+	var q = r.URL.Query()
+	if q.Has("dst") {
+		return false
+	}
+	for _, src := range q["src"] {
+		if !isCamID(src) {
+			return false
+		}
+	}
+	return true
+}
+
+// isCamID reports whether s is a camera stream name ("cam" + index).
+func isCamID(s string) bool {
+	if len(s) < 4 || len(s) > 8 || !strings.HasPrefix(s, "cam") {
+		return false
+	}
+	for _, c := range s[3:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // handleStream serves the /stream/ prefix through the go2rtc reverse proxy.
 func handleStream(w http.ResponseWriter, r *http.Request) {
+	if !streamProxyAllowed(r) {
+		writeJSON(w, 403, "{\"error\":\"stream endpoint not allowed\"}")
+		return
+	}
 	if streamProxy != nil {
 		streamProxy.ServeHTTP(w, r)
 		return

@@ -822,6 +822,15 @@ func camIsActive(camID string) bool {
 	return false
 }
 
+// onvifSubscribeRetry is the first pause between two rounds of subscription
+// attempts (webhook, then PullPoint) while a camera accepts neither; it doubles
+// on each failed round up to onvifSubscribeRetryMax, so a camera that answers
+// but refuses both is not hit with back-to-back webhook+PullPoint creations
+// (which some Tapo firmwares freeze on) every few seconds. Vars so tests can
+// shorten them.
+var onvifSubscribeRetry = 15 * time.Second
+var onvifSubscribeRetryMax = 5 * time.Minute
+
 // onvifEventLoop drives motion detection for one camera. It prefers the
 // push-based WS-Base webhook (camera POSTs events to our /onvif/notify URL):
 // this is the only working path on Tapo firmwares where PullPoint returns a
@@ -830,11 +839,14 @@ func camIsActive(camID string) bool {
 // connection and a webhook are created in sequence.
 func onvifEventLoop(app *App, cam *CameraCfg, camID string) {
 	var lastLog int64
+	var retryBase, retryMax = onvifSubscribeRetry, onvifSubscribeRetryMax
+	var retry = retryBase
 	for {
 		// 1) Try the webhook (preferred). If it succeeds, events arrive via the
 		// HTTP notify endpoint and we only need to renew the subscription.
 		if ok, serr := onvifEventSubscribePush(app, cam, camID); serr == nil && ok {
 			lastLog = 0
+			retry = retryBase
 			logIt(LINFO, "onvif motion via webhook subscribed", map[string]string{"camera": cam.Name, "url": redactNotifyURL(onvifNotifyURL(app))})
 			// Renew before the subscription termination time, unsubscribing
 			// the previous generation first so they don't accumulate.
@@ -842,22 +854,24 @@ func onvifEventLoop(app *App, cam *CameraCfg, camID string) {
 			onvifEventUnsubscribe(camID)
 			continue
 		}
-		// --- fallback: PullPoint subscription loop ---
-		var uri string
-		for {
-			var err error
-			uri, err = onvifEventSubscribe(cam)
-			if err == nil {
-				lastLog = 0
-				logIt(LINFO, "onvif motion via pullpoint subscribed", map[string]string{"camera": cam.Name})
-				break
-			}
+		// --- fallback: PullPoint subscription ---
+		// On failure go back to the top and try the webhook again: retrying
+		// only PullPoint here left a camera that was offline at boot (or at a
+		// renewal) without detection forever on firmwares whose PullPoint
+		// always faults, since the working webhook was never attempted again.
+		var uri, err = onvifEventSubscribe(cam)
+		if err != nil {
 			if time.Now().Unix()-lastLog >= 60 {
 				lastLog = time.Now().Unix()
-				logIt(LWARN, "onvif motion: no working subscription (webhook+pullpoint both failed)", map[string]string{"camera": cam.Name, "error": err.Error(), "hint": "ensure onvif_notify_url is reachable over plain HTTP from the camera"})
+				logIt(LWARN, "onvif motion: no working subscription (webhook+pullpoint both failed)", map[string]string{"camera": cam.Name, "error": err.Error(), "retry_in": retry.String(), "hint": "ensure onvif_notify_url is reachable over plain HTTP from the camera"})
 			}
-			time.Sleep(15 * time.Second)
+			time.Sleep(retry)
+			retry = min(retry*2, retryMax)
+			continue
 		}
+		lastLog = 0
+		retry = retryBase
+		logIt(LINFO, "onvif motion via pullpoint subscribed", map[string]string{"camera": cam.Name})
 		// Poll messages from the pullpoint subscription.
 		for {
 			var raw, perr = onvifPullOnce(uri, cam)

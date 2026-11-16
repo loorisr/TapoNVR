@@ -589,6 +589,22 @@ func setCamHold(camID string, v int) {
 	camOverrideMtx.Unlock()
 }
 
+// camDebounceOverridden / camHoldOverridden report whether a runtime override
+// (set through the API) is in effect for the camera.
+func camDebounceOverridden(camID string) bool {
+	camOverrideMtx.Lock()
+	defer camOverrideMtx.Unlock()
+	_, ok := debounceOverride[camID]
+	return ok
+}
+
+func camHoldOverridden(camID string) bool {
+	camOverrideMtx.Lock()
+	defer camOverrideMtx.Unlock()
+	_, ok := holdOverride[camID]
+	return ok
+}
+
 // getCamDebounce returns the per-camera debounce override, or def when unset.
 func getCamDebounce(camID string, def int) int {
 	camOverrideMtx.Lock()

@@ -675,10 +675,12 @@ export class VideoRTC extends HTMLElement {
             let url = '';
             try {
                 const wsURL = String(this.wsURL || '');
-                const wsIdx = wsURL.indexOf('/ws');
-                const scheme = wsURL.startsWith('wss://') ? 'https' : 'http';
-                const host = wsURL.replace(/^wss?:\/\//, '').split('/')[0];
-                url = scheme + '://' + host + '/hls/';
+                // HLS segments live next to the WebSocket endpoint
+                // (ws://host/stream/ws -> http://host/stream/hls/). lastIndexOf:
+                // a host starting with "ws" (ws://wsnvr/...) also contains "/ws".
+                const wsIdx = wsURL.lastIndexOf('/ws');
+                if (wsIdx < 0) return;
+                url = wsURL.substring(0, wsIdx).replace(/^ws/, 'http') + '/hls/';
             } catch (e) { return; }
             const playlist = msg.value.replace('hls/', url);
             try {
