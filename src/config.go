@@ -226,6 +226,11 @@ type PushoverCfg struct {
 	AppToken     string `yaml:"app_token"`
 	UserKey      string `yaml:"user_key"`
 	MinIntervalS int    `yaml:"min_interval_s"`
+	// RearmS: after a notification for a camera+type, suppress the next ones
+	// until that camera has gone RearmS seconds without any event of that
+	// type (object left). Stops repeated alerts for a parked car / a person
+	// staying in view. 0 disables it (only min_interval_s applies).
+	RearmS int `yaml:"rearm_s"`
 	// SendSnapshot attaches the detection snapshot to the notification.
 	// False sends text-only alerts. Defaults to true so existing configs
 	// keep today's behavior.
@@ -553,6 +558,7 @@ func configDefaults(c *Config) {
 	c.Alerts.Pushover.AppToken = ""
 	c.Alerts.Pushover.UserKey = ""
 	c.Alerts.Pushover.MinIntervalS = 60
+	c.Alerts.Pushover.RearmS = 60
 	c.Alerts.Pushover.SendSnapshot = true
 	c.Alerts.Pushover.SnapshotMaxPx = 1280
 	c.Alerts.Pushover.SnapshotQuality = 70
@@ -763,6 +769,10 @@ func loadConfig(path string) (*Config, error) {
 	if c.Alerts.Pushover.SnapshotQuality < 1 || c.Alerts.Pushover.SnapshotQuality > 100 {
 		configWarn("config clamped: alerts.pushover.snapshot_quality not in 1..100, using 70", nil)
 		c.Alerts.Pushover.SnapshotQuality = 70
+	}
+	if c.Alerts.Pushover.RearmS < 0 {
+		configWarn("config clamped: alerts.pushover.rearm_s < 0, using 0", nil)
+		c.Alerts.Pushover.RearmS = 0
 	}
 	if c.Alerts.Pushover.SnapshotMaxPx < 0 {
 		configWarn("config clamped: alerts.pushover.snapshot_max_px < 0, using 0", nil)

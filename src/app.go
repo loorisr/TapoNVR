@@ -291,6 +291,7 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		mqttPublishEvent(camID, camName, dtype, "", ev0.id, false)
 		return false
 	}
+	pushRearmTouch(camID, dtype, now, app.cfg.Alerts.Pushover.RearmS)
 	var postSec = int64(app.cfg.Record.PostDetection)
 	// Extend-or-reserve, atomically. The reservation happens BEFORE the slow
 	// collectDetection (snapshot capture can take seconds): events arriving

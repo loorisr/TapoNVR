@@ -103,6 +103,10 @@ alerts:
     app_token: APPTOKEN
     user_key: USERKEY
     min_interval_s: 30
+    # Re-arm on absence: after a notification for a camera+type, no new one
+    # until that camera has gone rearm_s seconds without any event of that
+    # type (stops repeated alerts for a parked car). 0 = off.
+    rearm_s: 60
     # Attach a compressed copy of the detection snapshot (false = text-only).
     send_snapshot: true
     # Long edge of the attached copy in pixels (0 = original size).
