@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.29
 # Builder runs on the build host's native arch and cross-compiles (pure Go, no
 # CGO): multi-arch images need no QEMU emulation for the slow compile step.
 FROM --platform=$BUILDPLATFORM golang:1-alpine AS builder
@@ -33,7 +33,7 @@ FROM --platform=$BUILDPLATFORM alpine:3.24 AS go2rtc-fetch
 # non-reproducible and skips verification unless GO2RTC_SHA256 is set.
 # NOTE: every go2rtc release before v1.9 was deleted upstream, so its download
 # URLs now 404 — the pin must stay on an existing release tag.
-ARG GO2RTC_VERSION=v1.9.14
+ARG GO2RTC_VERSION=v1.9.15
 # Per-architecture integrity pins for GO2RTC_VERSION. A single GO2RTC_SHA256
 # cannot work multi-arch: each CPU downloads a different artifact. Pass
 # GO2RTC_SHA256 to override the default pin when bumping GO2RTC_VERSION
@@ -53,10 +53,10 @@ ARG TARGETVARIANT
 RUN apk add --no-cache curl file \
     && arch="${TARGETARCH}${TARGETVARIANT}" \
     && case "$arch" in \
-         amd64) art=go2rtc_linux_amd64; expect=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6 ;; \
-         arm64) art=go2rtc_linux_arm64; expect=359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50 ;; \
-         armv7) art=go2rtc_linux_arm;   expect=4d7e1639af5a2722a28e864468fd8099b3c1682565446c798bf9e3b38fde12e4 ;; \
-         armv6) art=go2rtc_linux_armv6; expect=4dc20370556b29f3a90f4c7a09dcd95472c8f74cca56d4d1fb91f32bdd15174c ;; \
+         amd64) art=go2rtc_linux_amd64; expect=20b46c6910734cb05ecefb234066f36868ff19b42ba1418a7a32e13a3e035712 ;; \
+         arm64) art=go2rtc_linux_arm64; expect=af416f22b21a24ab83b8d78642190b4932ae695b4e386853f11d1b0319781763 ;; \
+         armv7) art=go2rtc_linux_arm;   expect=cbffe4075a004e2015fd9d7e324800ab7968b52f49e9ce803361879d5e246028 ;; \
+         armv6) art=go2rtc_linux_armv6; expect=7dc73f47548fbe472fb6e90b01abe6c1eb50e0073b22bfc4bcf34feaabc6c88d ;; \
          *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
        esac \
     && [ -z "$GO2RTC_SHA256" ] || expect="$GO2RTC_SHA256" \

@@ -160,33 +160,45 @@ if [ "$DO_DOCKER" -eq 1 ]; then
       warn "refusing to write suspicious image ref: $new"
       return 0
     fi
-    sed -i -E "s|${pattern}|FROM ${new}|" "$DOCKERFILE"
+    # Keep an optional "--platform=..." flag between FROM and the image.
+    sed -i -E "s|${pattern}|\\1${new}|" "$DOCKERFILE"
     CHANGED=1
     log "Dockerfile: $current -> $new"
   }
 
+  # Image ref of the first FROM line matching $1 (skips "--platform=..."
+  # flags). Empty when absent (never fails under set -e/pipefail).
+  from_image() {
+    { grep -m1 -E "^FROM (--platform=[^ ]+ )?$1" "$DOCKERFILE" || true; } \
+      | awk '{for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit }}'
+  }
+
   # --- golang:X-alpine (builder) ---
-  CUR_GOLANG="$(grep -m1 -E '^FROM golang:' "$DOCKERFILE" | awk '{print $2}')"
-  if [ -n "$CUR_GOLANG" ]; then
+  # A floating major tag (golang:1-alpine) already tracks the latest release
+  # (GOTOOLCHAIN=auto follows go.mod): only pinned minors are bumped.
+  CUR_GOLANG="$(from_image 'golang:')"
+  if [ "$CUR_GOLANG" = "golang:1-alpine" ]; then
+    ok "$CUR_GOLANG (floating tag, nothing to bump)"
+  elif [ -n "$CUR_GOLANG" ]; then
     if LATEST_MINOR="$(dockerhub_latest 'library/golang' '^1\.[0-9]+-alpine$')"; then
-      bump_docker_from '^FROM golang:[^ ]+' "$CUR_GOLANG" "golang:${LATEST_MINOR}"
+      bump_docker_from '^(FROM (--platform=[^ ]+ )?)golang:[^ ]+' "$CUR_GOLANG" "golang:${LATEST_MINOR}"
     else
       warn "could not resolve latest golang tag — leaving $CUR_GOLANG"
     fi
   fi
 
   # --- alpine:3.x (go2rtc-fetch) ---
-  CUR_ALPINE="$(grep -m1 -E '^FROM alpine:' "$DOCKERFILE" | awk '{print $2}')"
+  CUR_ALPINE="$(from_image 'alpine:')"
   if [ -n "$CUR_ALPINE" ]; then
     if LATEST_ALPINE="$(dockerhub_latest 'library/alpine' '^3\.[0-9]+$')"; then
-      bump_docker_from '^FROM alpine:[^ ]+' "$CUR_ALPINE" "alpine:${LATEST_ALPINE}"
+      bump_docker_from '^(FROM (--platform=[^ ]+ )?)alpine:[^ ]+' "$CUR_ALPINE" "alpine:${LATEST_ALPINE}"
     else
       warn "could not resolve latest alpine tag — leaving $CUR_ALPINE"
     fi
   fi
 
   # --- docker/dockerfile syntax ---
-  CUR_SYNTAX="$(grep -m1 -E '^# syntax=docker/dockerfile:' "$DOCKERFILE" | sed -E 's|.*docker/dockerfile:||')"
+  CUR_SYNTAX="$({ grep -m1 -E '^# syntax=docker/dockerfile:' "$DOCKERFILE" || true; } | sed -E 's|.*docker/dockerfile:||')"
   if [ -n "$CUR_SYNTAX" ]; then
     if LATEST_SYNTAX="$(dockerhub_latest 'docker/dockerfile' '^1\.[0-9]+$')"; then
       if [ "$CUR_SYNTAX" != "$LATEST_SYNTAX" ]; then
