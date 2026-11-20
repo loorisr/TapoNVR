@@ -23,9 +23,11 @@ import (
 	"image/color"
 	"image/jpeg"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2917,17 +2919,44 @@ func pruneByType(app *App) {
 	}
 }
 
-// diskGuardPrune enforces storage.max_disk_pct / min_free_gb: when data_dir's
-// filesystem breaches either threshold, oldest unlocked detections are deleted
-// (DB-first, bounded per pass) until back under, or nothing prunable remains.
-// Locked recordings are never touched.
+// recordingsSizeBytes walks data_dir/detections (clips + snapshots) and
+// returns the total size of the regular files found.
+func recordingsSizeBytes(app *App) int64 {
+	var total int64
+	_ = filepath.WalkDir(app.cfg.Server.DataDir+"/detections", func(_ string, de fs.DirEntry, err error) error {
+		if err != nil || de.IsDir() {
+			return nil
+		}
+		if info, ierr := de.Info(); ierr == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// diskGuardPrune enforces storage.max_disk_pct / min_free_gb (filesystem of
+// data_dir) and storage.max_size_gb (total size of the recordings): when any
+// threshold is breached, oldest unlocked detections are deleted (DB-first,
+// bounded per pass) until back under, or nothing prunable remains. Locked
+// recordings are never touched (they still count toward max_size_gb).
 func diskGuardPrune(app *App) {
 	var maxPct = app.cfg.Storage.MaxDiskPct
 	var minGB = app.cfg.Storage.MinFreeGB
-	if maxPct <= 0 && minGB <= 0 {
+	var maxSize = int64(app.cfg.Storage.MaxSizeGB * 1e9)
+	if maxPct <= 0 && minGB <= 0 && maxSize <= 0 {
 		return
 	}
-	over := func() (bool, string) {
+	// The recordings size is walked once, then tracked in memory as rows are
+	// deleted (a walk per deletion would be far too slow on a big archive).
+	var recBytes int64
+	if maxSize > 0 {
+		recBytes = recordingsSizeBytes(app)
+	}
+	fsOver := func() (bool, string) {
+		if maxPct <= 0 && minGB <= 0 {
+			return false, ""
+		}
 		free, total := fsFreeTotal(app.cfg.Server.DataDir)
 		if total <= 0 {
 			return false, ""
@@ -2941,46 +2970,64 @@ func diskGuardPrune(app *App) {
 		}
 		return false, ""
 	}
-	ok, _ := over()
-	if !ok {
+	sizeOver := func() bool { return maxSize > 0 && recBytes > maxSize }
+	fsBad, reason := fsOver()
+	if !fsBad && !sizeOver() {
 		return
+	}
+	if !fsBad {
+		reason = "max_size_gb"
 	}
 	// All ended, oldest first (currently recording rows have future ended_at).
 	const maxGuardPerPass = 500
 	cands, err := listOldDetections(app.db, time.Now().Unix()+1, maxGuardPerPass)
 	if err != nil || len(cands) == 0 {
-		logIt(LWARN, "disk guard: threshold breached but nothing prunable (all locked/recording?)", nil)
+		logIt(LWARN, "disk guard: threshold breached but nothing prunable (all locked/recording?)", map[string]string{"reason": reason})
 		return
 	}
 	var removed int
+	var freed int64
 	for i := range cands {
 		if i >= maxGuardPerPass {
 			break
 		}
-		if i%50 == 0 {
-			if ok, _ := over(); !ok {
-				break
-			}
+		// The filesystem check is a statfs: re-evaluated every 50 rows; the
+		// size check is in memory and exact, so it runs every row.
+		if i%50 == 0 && i > 0 {
+			fsBad, _ = fsOver()
+		}
+		if !fsBad && !sizeOver() {
+			break
 		}
 		var d = cands[i]
+		var sz = detectionSize(&d)
 		if !pruneDeleteRow(app, d.id) {
 			continue
 		}
 		deleteDetectionFiles(app, &d)
+		recBytes -= sz
+		freed += sz
 		removed++
 	}
-	if ok, _ := over(); ok {
-		logIt(LWARN, "disk guard: still over threshold after pass (locked rows or cap reached)", map[string]string{"removed": strconv.Itoa(removed)})
+	pruneEmptyDirs(app.cfg.Server.DataDir + "/detections")
+	var fields = map[string]string{"reason": reason, "removed": strconv.Itoa(removed), "freed_mb": strconv.FormatInt(freed/1e6, 10)}
+	if maxSize > 0 {
+		fields["recordings_gb"] = strconv.FormatFloat(float64(recBytes)/1e9, 'f', 2, 64)
+	}
+	if fsBad, _ = fsOver(); fsBad || sizeOver() {
+		logIt(LWARN, "disk guard: still over threshold after pass (locked rows or cap reached)", fields)
 	} else {
-		logIt(LWARN, "disk guard: pruned back under threshold", map[string]string{"removed": strconv.Itoa(removed)})
+		logIt(LWARN, "disk guard: pruned back under threshold", fields)
 	}
 }
 
 // startPruneLoop reruns retention pruning daily (plus the boot pass in main).
 // Without this, retention_days only takes effect on restart and disk grows
-// unbounded between restarts. The disk guard (max_disk_pct / min_free_gb) is
-// an emergency brake, so it is also checked hourly: a busy camera can fill a
-// small disk long before the next daily pass. The same hourly tick retries
+// unbounded between restarts. The disk guard (max_disk_pct / min_free_gb /
+// max_size_gb) is
+// an emergency brake, so it is also checked every 10 minutes: a busy camera
+// (a 4 Mb/s stream is ~1.8 GB/h) can fill a small disk or overshoot
+// max_size_gb long before the next daily pass. An hourly tick retries
 // S3 uploads that failed (network/S3 outage) instead of leaving them pending
 // until someone presses the retry button.
 func startPruneLoop(app *App) {
@@ -2989,14 +3036,17 @@ func startPruneLoop(app *App) {
 		defer daily.Stop()
 		var hourly = time.NewTicker(time.Hour)
 		defer hourly.Stop()
+		var guard = time.NewTicker(10 * time.Minute)
+		defer guard.Stop()
 		for {
 			select {
 			case <-daily.C:
 				pruneOnce(app)
-			case <-hourly.C:
+			case <-guard.C:
 				pruneMtx.Lock()
 				diskGuardPrune(app)
 				pruneMtx.Unlock()
+			case <-hourly.C:
 				s3RetryAuto(app)
 			}
 		}

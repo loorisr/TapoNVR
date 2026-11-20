@@ -89,6 +89,13 @@ type RecordCfg struct {
 	// absent from the map, or with a value <= 0, falls back to the global
 	// retention. Locked recordings are never pruned by either rule.
 	RetentionByType map[string]int `yaml:"retention_by_type"`
+	// RearmS: once a detection group was recorded for a camera+type, events
+	// of the same type do not start a new group (no clip, no snapshots) until
+	// that camera has gone RearmS seconds without any event of that type. The
+	// first group still records up to its normal length; an object staying in
+	// view is then only logged as raw events. A different type (a person next
+	// to the parked car) is recorded. 0 = record every group (default).
+	RearmS int `yaml:"rearm_s"`
 }
 
 // recordKnownKeys lists every YAML key accepted under `record:`, and
@@ -101,6 +108,7 @@ var recordKnownKeys = map[string]bool{
 	"pre_detection_seconds": true, "post_detection_seconds": true,
 	"buffer_seconds": true, "clip_seconds": true,
 	"buffer_dir": true, "snapshots": true, "retention_by_type": true,
+	"rearm_s": true,
 }
 var snapshotKnownKeys = map[string]bool{
 	"enabled": true, "count": true, "interval_s": true,
@@ -143,6 +151,7 @@ func (r *RecordCfg) UnmarshalYAML(node *yaml.Node) error {
 		ClipSeconds   *int           `yaml:"clip_seconds"`
 		BufferDir     *string        `yaml:"buffer_dir"`
 		RetByType     map[string]int `yaml:"retention_by_type"`
+		RearmS        *int           `yaml:"rearm_s"`
 	}
 	if err := node.Decode(&aux); err != nil {
 		return err
@@ -159,6 +168,9 @@ func (r *RecordCfg) UnmarshalYAML(node *yaml.Node) error {
 	}
 	if aux.RetByType != nil {
 		r.RetentionByType = aux.RetByType
+	}
+	if aux.RearmS != nil {
+		r.RearmS = *aux.RearmS
 	}
 	// Decode the snapshots sub-node INTO the existing value: a wholesale copy of
 	// a freshly-decoded struct would reset the count/interval_s defaults to 0
@@ -219,6 +231,10 @@ type StorageCfg struct {
 	// MinFreeGB keeps at least this many free gigabytes on data_dir's
 	// filesystem (0 = off). Same emergency pruning as MaxDiskPct.
 	MinFreeGB float64 `yaml:"min_free_gb"`
+	// MaxSizeGB caps the total size of the recordings (clips + snapshots
+	// under data_dir/detections), in gigabytes (0 = off). When exceeded,
+	// oldest unlocked detections are pruned until back under.
+	MaxSizeGB float64 `yaml:"max_size_gb"`
 }
 
 type PushoverCfg struct {
@@ -705,6 +721,10 @@ func validateConfig(c *Config) {
 		configWarn("config: storage.min_free_gb < 0, disabled", nil)
 		c.Storage.MinFreeGB = 0
 	}
+	if c.Storage.MaxSizeGB < 0 {
+		configWarn("config: storage.max_size_gb < 0, disabled", nil)
+		c.Storage.MaxSizeGB = 0
+	}
 	switch strings.ToLower(strings.TrimSpace(c.Stream.Go2rtcLogLevel)) {
 	case "", "trace", "debug", "info", "warn", "error":
 		if strings.TrimSpace(c.Stream.Go2rtcLogLevel) == "" {
@@ -794,6 +814,7 @@ func loadConfig(path string) (*Config, error) {
 		{"vision.rearm_s", &c.Vision.RearmS},
 		{"mqtt.rearm_s", &c.Mqtt.RearmS},
 		{"llm.rearm_s", &c.LLM.RearmS},
+		{"record.rearm_s", &c.Record.RearmS},
 	} {
 		if *r.v < 0 {
 			configWarn("config clamped: "+r.name+" < 0, using 0", nil)

@@ -20,10 +20,11 @@ const (
 	rearmVision                      // vision.rearm_s (YOLO on new groups)
 	rearmMQTT                        // mqtt.rearm_s (event + detection messages)
 	rearmLLM                         // llm.rearm_s (automatic analysis)
+	rearmRecord                      // record.rearm_s (new detection groups)
 	rearmCount
 )
 
-var rearmNames = [rearmCount]string{"pushover", "vision", "mqtt", "llm"}
+var rearmNames = [rearmCount]string{"pushover", "vision", "mqtt", "llm", "record"}
 
 type rearmWindows [rearmCount]int
 
@@ -36,6 +37,7 @@ func rearmWindowsFromConfig(c *Config) rearmWindows {
 	w[rearmVision] = c.Vision.RearmS
 	w[rearmMQTT] = c.Mqtt.RearmS
 	w[rearmLLM] = c.LLM.RearmS
+	w[rearmRecord] = c.Record.RearmS
 	return w
 }
 

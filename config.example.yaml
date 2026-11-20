@@ -52,6 +52,13 @@ record:
   mode: buffer
   # Master switch for clip recording. Disable to only save snapshots.
   enabled: true
+  # Re-arm on absence for recordings: once a camera+type was recorded, events
+  # of the same type do not start a new detection (no clip, no snapshots)
+  # until that camera has gone rearm_s seconds without an event of that type.
+  # The first clip still runs its normal length (~2 min max while active); a
+  # car parked all day then only logs raw events. Another type (a person
+  # walking by) is still recorded. 0 = record continuously (default).
+  rearm_s: 0
   # Per-type retention overrides (days, optional): a type listed here is
   # pruned after its own window instead of retention_days above
   # (e.g. motion: 3 keeps motion 3 days, person: 30 keeps person 30 days).
@@ -83,10 +90,13 @@ record:
 storage:
   enabled: false
   # Disk guard (0 = off): when data_dir's filesystem breaches either
-  # threshold, oldest unlocked detections are pruned until back under.
-  # Checked at boot, then hourly.
+  # threshold, or the recordings (clips + snapshots) exceed max_size_gb,
+  # oldest unlocked detections are pruned until back under (their S3 copies
+  # too). Locked recordings are kept but count toward max_size_gb.
+  # Checked at boot, then every 10 minutes.
   # max_disk_pct: 90
   # min_free_gb: 1
+  # max_size_gb: 100
   s3:
     endpoint: http://localhost:9000
     region: us-east-1

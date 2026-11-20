@@ -324,6 +324,21 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		}
 	}
 	var detID string
+	if !extended && !rearmTake(rearmRecord, camID, dtype, now, app.cfg.Record.RearmS) {
+		// record.rearm_s: the same object is still in view and was already
+		// recorded. Log the raw event only: no new group, clip or snapshots
+		// (and therefore no alert/YOLO/LLM either).
+		groupMtx.Unlock()
+		var ev = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: "", bbox: bbox}
+		if err := dbInsertOnvifEvent(app.db, &ev); err != nil {
+			logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})
+		}
+		logIt(LDEBUG, "new group skipped (object still present, record not re-armed)", map[string]string{"camera": camName, "type": normalizeDetType(dtype), "id": ev.id})
+		if mqttRearmTake(app, camID, dtype, now) {
+			mqttPublishEvent(camID, camName, dtype, "", ev.id, false)
+		}
+		return false
+	}
 	if !extended {
 		detID = newID()
 		setActiveRec(camID, &activeRec{id: detID, firstAt: now, lastAt: now, endAt: now + postSec, detType: normalizeDetType(dtype), detTypes: normalizeDetType(dtype), detSource: normalizeDetSource(srcKind)})
@@ -388,8 +403,12 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 	// extensions that landed during capture into the final end time)
 	var det, err = collectDetectionWithID(app, camID, camName, src, dtype, detID, srcKind, bbox)
 	if err != nil || det == nil {
-		// Don't leave a phantom slot that would swallow future events.
+		// Don't leave a phantom slot that would swallow future events, nor a
+		// consumed record.rearm_s slot for a group that was never recorded.
 		clearActiveRec(camID, detID)
+		if app.cfg.Record.RearmS > 0 {
+			rearmRestore(rearmRecord, rearmKey(camID, dtype))
+		}
 		var ev = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: "", bbox: bbox}
 		if err := dbInsertOnvifEvent(app.db, &ev); err != nil {
 			logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})

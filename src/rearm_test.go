@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 func resetPushRearm() {
 	rearmMtx.Lock()
@@ -192,4 +196,41 @@ func TestRearmGateNewGroup(t *testing.T) {
 			t.Fatal("mqtt off must not suppress")
 		}
 	})
+}
+
+// record.rearm_s: a stationary object gets one group; later events of the
+// same type are only logged, another type still records, absence re-arms.
+func TestRearmRecordConsumer(t *testing.T) {
+	resetPushRearm()
+	var w rearmWindows
+	w[rearmRecord] = 120
+	rearmTouch("cam1", "vehicle", 1000, w)
+	if !rearmTake(rearmRecord, "cam1", "vehicle", 1000, 120) {
+		t.Fatal("first group must record")
+	}
+	for ts := int64(1060); ts <= 5000; ts += 60 { // first clip closed, car still there
+		rearmTouch("cam1", "vehicle", ts, w)
+		if rearmTake(rearmRecord, "cam1", "vehicle", ts, 120) {
+			t.Fatalf("stationary object must not start a new group at %d", ts)
+		}
+	}
+	rearmTouch("cam1", "person", 5010, w)
+	if !rearmTake(rearmRecord, "cam1", "person", 5010, 120) {
+		t.Fatal("another type must still record")
+	}
+	rearmTouch("cam1", "vehicle", 5200, w) // 260s without vehicle events
+	if !rearmTake(rearmRecord, "cam1", "vehicle", 5200, 120) {
+		t.Fatal("must re-arm after record.rearm_s of absence")
+	}
+}
+
+// record.rearm_s is accepted by the strict record: decoder.
+func TestRecordRearmYAML(t *testing.T) {
+	var r RecordCfg
+	if err := yaml.Unmarshal([]byte("rearm_s: 300\n"), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.RearmS != 300 {
+		t.Fatalf("rearm_s = %d", r.RearmS)
+	}
 }

@@ -153,9 +153,11 @@ See `config.example.yaml` for the full file. Key settings:
 | `record.mode` | `event` (record around detections) or `buffer` (rolling window, frozen on detection) |
 | `record.pre_detection` / `record.post_detection` | Seconds recorded before and after a detection |
 | `record.enabled` | Master switch for clip recording (default `true`) |
+| `record.rearm_s` | Re-arm on absence for recordings (default `0` = off: an object staying in view is recorded as back-to-back clips). When set, once a camera+type was recorded no new detection (clip, snapshots, alerts) starts for that type until the camera has gone `rearm_s` seconds without an event of that type; raw events are still logged and another type is still recorded |
 | `record.snapshots.enabled` | Master switch for snapshots (default `true`) |
 | `record.snapshots.count` / `record.snapshots.interval_s` | Snapshots per detection and minimum delay between captures (`count: -1` = shoot while motion is active, capped at 60 shots / 180 s) |
 | `storage.enabled` / `storage.s3.*` | S3-compatible upload (MinIO, R2, …) |
+| `storage.max_size_gb` / `storage.max_disk_pct` / `storage.min_free_gb` | Disk guard (0 = off, checked at boot then every 10 min): when the recordings (clips + snapshots under `data_dir/detections`) exceed `max_size_gb`, or data_dir's filesystem breaches `max_disk_pct` / `min_free_gb`, the oldest unlocked detections are deleted (with their S3 copies) until back under. Locked recordings are never deleted but still count toward `max_size_gb` |
 | `mqtt.*` | MQTT broker connection and event publishing (`rearm_s`, default 60, 0 = off: once a camera+type was published, its raw events and new detection groups stay silent until that camera has gone `rearm_s` seconds without an event of that type; a tag promotion to an armed type is still published) |
 | `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent; `rearm_s`, default 60, 0 = off: new detection groups of an object staying in view are not re-analyzed until that camera has gone `rearm_s` seconds without an event of that type; manual re-analysis is not limited) |
 | `detection.source` | `onvif` (webhook, type only — default), `rtsp` (camera AI boxes + type from H.264 SEI), or `both` |
