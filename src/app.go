@@ -282,16 +282,20 @@ func handleRawOnvifEvent(app *App, camID string, camName string, dtype string, s
 // alerts can name the detection source.
 func handleRawDetectionEvent(app *App, camID string, camName string, dtype string, src string, srcKind string, bbox string) bool {
 	var now = time.Now().Unix()
+	// Presence tracking for the re-arm limits (pushover, vision, mqtt, llm):
+	// recorded before any consumer is asked so the gap decides re-arming.
+	rearmTouch(camID, dtype, now, rearmWindowsFromConfig(app.cfg))
 	if !detectionEnabled() {
 		var ev0 = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: "", bbox: bbox}
 		if err := dbInsertOnvifEvent(app.db, &ev0); err != nil {
 			logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})
 		}
 		logIt(LDEBUG, "onvif raw event (detection disabled)", map[string]string{"camera": camName, "type": dtype, "id": ev0.id})
-		mqttPublishEvent(camID, camName, dtype, "", ev0.id, false)
+		if mqttRearmTake(app, camID, dtype, now) {
+			mqttPublishEvent(camID, camName, dtype, "", ev0.id, false)
+		}
 		return false
 	}
-	pushRearmTouch(camID, dtype, now, app.cfg.Alerts.Pushover.RearmS)
 	var postSec = int64(app.cfg.Record.PostDetection)
 	// Extend-or-reserve, atomically. The reservation happens BEFORE the slow
 	// collectDetection (snapshot capture can take seconds): events arriving
@@ -331,6 +335,7 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 	}
 	groupMtx.Unlock()
 	if extended {
+		var mqttOK = mqttRearmTake(app, camID, dtype, now)
 		var ev = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: extID, bbox: bbox}
 		if err := dbInsertOnvifEvent(app.db, &ev); err != nil {
 			logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})
@@ -358,6 +363,11 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 			logIt(LWARN, "db tag merge failed", map[string]string{"error": terr.Error()})
 		} else if found && promoted {
 			if det, derr := getDetection(app.db, extID); derr == nil && det != nil {
+				// A muted group (stationary object) speaks again on MQTT only
+				// when the promoted type is itself armed.
+				if mqttOK {
+					detGateUnmute(extID, rearmMQTT)
+				}
 				mqttPublishDetection(det)
 				broadcastDetection(camID, camName, dtype, bbox)
 				go pushNotifyDetection(app, dtype, "Detection: "+camName, dtype+" detected on "+camName, det, detSnapSetByID(extID))
@@ -366,9 +376,14 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		}
 		logIt(LDEBUG, "onvif raw event (grouped)", map[string]string{"camera": camName, "type": dtype, "id": ev.id, "group": extID})
 		logIt(LINFO, "recording extended", map[string]string{"camera": camName, "id": extID, "new_end": strconv.FormatInt(now+postSec, 10)})
-		mqttPublishEvent(camID, camName, dtype, extID, ev.id, false)
+		if mqttOK {
+			mqttPublishEvent(camID, camName, dtype, extID, ev.id, false)
+		}
 		return false
 	}
+	// New group: decide once, per consumer, whether this group acts or stays
+	// silent because the same object is still in view (re-arm on absence).
+	var mqttOK = rearmGateNewGroup(app, detID, camID, dtype, now)
 	// 3) fresh recording with the reserved id (collectDetection merges any
 	// extensions that landed during capture into the final end time)
 	var det, err = collectDetectionWithID(app, camID, camName, src, dtype, detID, srcKind, bbox)
@@ -379,7 +394,9 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		if err := dbInsertOnvifEvent(app.db, &ev); err != nil {
 			logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})
 		}
-		mqttPublishEvent(camID, camName, dtype, "", ev.id, false)
+		if mqttOK {
+			mqttPublishEvent(camID, camName, dtype, "", ev.id, false)
+		}
 		return false
 	}
 	var ev2 = OnvifEvent{id: newID(), cameraID: camID, camName: camName, detType: dtype, createdAt: now, detectionID: det.id, bbox: bbox}
@@ -387,7 +404,9 @@ func handleRawDetectionEvent(app *App, camID string, camName string, dtype strin
 		logIt(LWARN, "db event insert failed", map[string]string{"error": err.Error()})
 	}
 	logIt(LDEBUG, "onvif raw event (new group)", map[string]string{"camera": camName, "type": dtype, "id": ev2.id, "group": det.id})
-	mqttPublishEvent(camID, camName, dtype, det.id, ev2.id, true)
+	if mqttOK {
+		mqttPublishEvent(camID, camName, dtype, det.id, ev2.id, true)
+	}
 	// Slot already reserved above (and re-registered by collectDetection with
 	// the merged end time); nothing left to do.
 	return true

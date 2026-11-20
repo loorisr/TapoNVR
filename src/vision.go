@@ -489,7 +489,7 @@ func analyzeAndStoreSnapshot(app *App, detID string, snapPath string, snapIndex 
 // queueVisionForDetection fires the async analysis for a detection's
 // snapshots: primary always, extras only when vision.snapshots=all.
 func queueVisionForDetection(app *App, detID string, primarySnap string) {
-	if !visionShouldAnalyze(app) || detID == "" || primarySnap == "" {
+	if !visionShouldAnalyze(app) || detID == "" || primarySnap == "" || detGateMuted(detID, rearmVision) {
 		return
 	}
 	s, err := os.Stat(primarySnap)
@@ -502,7 +502,7 @@ func queueVisionForDetection(app *App, detID string, primarySnap string) {
 // queueVisionForExtras fires analysis for burst extras (snapshots=all only).
 // extras[i] is snapshot index i+1 (matching /snapshot/{n}).
 func queueVisionForExtras(app *App, detID string, extras []string) {
-	if !visionShouldAnalyze(app) || detID == "" {
+	if !visionShouldAnalyze(app) || detID == "" || detGateMuted(detID, rearmVision) {
 		return
 	}
 	if strings.ToLower(strings.TrimSpace(app.cfg.Vision.Snapshots)) != "all" {

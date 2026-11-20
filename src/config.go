@@ -271,6 +271,11 @@ type MqttCfg struct {
 	// (snapshot_absolute_url / clip_absolute_url) in addition to the relative paths.
 	// When unset, the origin of server.onvif_notify_url is used as fallback.
 	BaseURL string `yaml:"base_url"`
+	// RearmS: after an event/detection message for a camera+type, suppress
+	// the next ones (raw events and new detection groups, including their
+	// later republishes) until that camera has gone RearmS seconds without
+	// any event of that type. 0 publishes every event.
+	RearmS int `yaml:"rearm_s"`
 }
 
 // VisionCfg configures optional snapshot analysis via an external YOLO
@@ -294,6 +299,11 @@ type VisionCfg struct {
 	Snapshots string `yaml:"snapshots"`
 	// MaxWorkers bounds concurrent /v1/detect calls (clamped 1..8).
 	MaxWorkers int `yaml:"max_workers"`
+	// RearmS: after a new detection group for a camera+type was analyzed,
+	// skip the analysis of the next groups until that camera has gone RearmS
+	// seconds without any event of that type (stationary object). 0 analyzes
+	// every group. Manual re-analysis is never limited.
+	RearmS int `yaml:"rearm_s"`
 }
 
 // LLMCfg configures the optional vision-LLM description of detections: the
@@ -331,6 +341,9 @@ type LLMCfg struct {
 	// Auto analyzes every new detection once its media is ready. false =
 	// on demand only (WebUI button / POST /api/detections/{id}/llm).
 	Auto bool `yaml:"auto"`
+	// RearmS: same presence limit as vision.rearm_s, for the automatic
+	// analysis. 0 analyzes every group.
+	RearmS int `yaml:"rearm_s"`
 	// Events restricts automatic analysis to these detection types (motion,
 	// person, vehicle, pet, other). Empty = every type.
 	Events []string `yaml:"events"`
@@ -580,6 +593,9 @@ func configDefaults(c *Config) {
 	c.Vision.Classes = ""
 	c.Vision.Snapshots = "primary"
 	c.Vision.MaxWorkers = 2
+	c.Vision.RearmS = 60
+	c.Mqtt.RearmS = 60
+	c.LLM.RearmS = 60
 	c.LLM.Enabled = false
 	c.LLM.Source = "snapshots"
 	c.LLM.MaxImages = 6
@@ -770,9 +786,19 @@ func loadConfig(path string) (*Config, error) {
 		configWarn("config clamped: alerts.pushover.snapshot_quality not in 1..100, using 70", nil)
 		c.Alerts.Pushover.SnapshotQuality = 70
 	}
-	if c.Alerts.Pushover.RearmS < 0 {
-		configWarn("config clamped: alerts.pushover.rearm_s < 0, using 0", nil)
-		c.Alerts.Pushover.RearmS = 0
+	for _, r := range []struct {
+		name string
+		v    *int
+	}{
+		{"alerts.pushover.rearm_s", &c.Alerts.Pushover.RearmS},
+		{"vision.rearm_s", &c.Vision.RearmS},
+		{"mqtt.rearm_s", &c.Mqtt.RearmS},
+		{"llm.rearm_s", &c.LLM.RearmS},
+	} {
+		if *r.v < 0 {
+			configWarn("config clamped: "+r.name+" < 0, using 0", nil)
+			*r.v = 0
+		}
 	}
 	if c.Alerts.Pushover.SnapshotMaxPx < 0 {
 		configWarn("config clamped: alerts.pushover.snapshot_max_px < 0, using 0", nil)

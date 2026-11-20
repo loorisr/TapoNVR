@@ -324,7 +324,7 @@ func mqttDetectionPayload(d *Detection) string {
 
 // mqttPublishDetection publishes a full detection record (after DB insert).
 func mqttPublishDetection(d *Detection) {
-	if d == nil {
+	if d == nil || detGateMuted(d.id, rearmMQTT) {
 		return
 	}
 	mqttMtx.Lock()

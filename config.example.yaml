@@ -143,6 +143,11 @@ mqtt:
   # carry absolute snapshot_absolute_url/clip_absolute_url (+ snapshots_absolute).
   # When unset, the origin of server.onvif_notify_url is used as fallback.
   # base_url: http://192.168.1.10:8971
+  # Re-arm on absence: after an event/detection message for a camera+type, the
+  # next ones (raw events, new detection groups and their republishes) are not
+  # published until that camera has gone rearm_s seconds without any event of
+  # that type (a parked car stays silent). 0 = publish every event.
+  rearm_s: 60
 
 # Optional snapshot analysis via an external YOLO HTTP API (NVR Vision).
 # Snapshot in, detections out. Disabled by default (zero impact when off).
@@ -164,6 +169,10 @@ vision:
   snapshots: primary
   # Max concurrent /v1/detect calls (1..8, keeps the ORT pool responsive).
   max_workers: 2
+  # Re-arm on absence: once a camera+type was analyzed, new detection groups
+  # of the same object are not sent to YOLO until that camera has gone
+  # rearm_s seconds without any event of that type. 0 = analyze every group.
+  rearm_s: 60
 
 # Optional vision-LLM description of each detection: the snapshots and/or
 # keyframes sampled from the clip are sent to a multimodal model, which writes a
@@ -198,6 +207,9 @@ llm:
   auto: true
   # Restrict automatic analysis to these types (empty = all).
   events: []
+  # Re-arm on absence for the automatic analysis (same as vision.rearm_s).
+  # 0 = analyze every group.
+  rearm_s: 60
 
 # Where detections come from.
 #   onvif (default): the camera POSTs ONVIF motion/person/vehicle/pet events to

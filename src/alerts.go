@@ -22,80 +22,9 @@ import (
 var pushRateMtx sync.Mutex
 var lastPushUnix int64
 
-// Re-arm on absence (alerts.pushover.rearm_s): after a notification for a
-// camera+type, the next one for that key is suppressed until the camera has
-// gone rearm_s seconds without any event of that type. A parked car or a
-// seated person keeps emitting events (intermittently, forking new detection
-// groups), so the key stays disarmed for as long as the object is there.
-type pushRearmState struct {
-	lastEventAt int64
-	armed       bool
-}
-
-var pushRearmMtx sync.Mutex
-var pushRearmMap = map[string]*pushRearmState{}
-
-func pushRearmKey(camID string, eventType string) string {
-	return camID + "|" + normalizeDetType(eventType)
-}
-
-// pushRearmTouch records a raw detection event. It runs before the matching
-// notification is attempted, so the gap since the previous event decides
-// whether the key re-arms (the notification goroutine would otherwise see the
-// fresh timestamp and lose the gap).
-func pushRearmTouch(camID string, eventType string, now int64, rearmS int) {
-	if rearmS <= 0 || camID == "" {
-		return
-	}
-	var key = pushRearmKey(camID, eventType)
-	pushRearmMtx.Lock()
-	defer pushRearmMtx.Unlock()
-	var st = pushRearmMap[key]
-	if st == nil {
-		pushRearmMap[key] = &pushRearmState{lastEventAt: now, armed: true}
-		return
-	}
-	if now-st.lastEventAt >= int64(rearmS) {
-		st.armed = true
-	}
-	st.lastEventAt = now
-}
-
-// pushRearmTake reports whether camID+eventType may notify, and disarms the
-// key when it does. Unknown keys (no event recorded) are armed.
-func pushRearmTake(camID string, eventType string, now int64, rearmS int) bool {
-	if rearmS <= 0 || camID == "" {
-		return true
-	}
-	var key = pushRearmKey(camID, eventType)
-	pushRearmMtx.Lock()
-	defer pushRearmMtx.Unlock()
-	var st = pushRearmMap[key]
-	if st == nil {
-		pushRearmMap[key] = &pushRearmState{lastEventAt: now, armed: false}
-		return true
-	}
-	if !st.armed && now-st.lastEventAt >= int64(rearmS) {
-		st.armed = true
-	}
-	if !st.armed {
-		return false
-	}
-	st.armed = false
-	return true
-}
-
-// pushRearmRestore re-arms a key whose notification was not delivered.
-func pushRearmRestore(key string) {
-	if key == "" {
-		return
-	}
-	pushRearmMtx.Lock()
-	if st := pushRearmMap[key]; st != nil {
-		st.armed = true
-	}
-	pushRearmMtx.Unlock()
-}
+// Re-arm on absence (alerts.pushover.rearm_s): see rearm.go. After a
+// notification for a camera+type the next ones are suppressed until that
+// camera has gone rearm_s seconds without any event of that type.
 
 // pushAttachMaxBytes caps the Pushover attachment size. A compressed copy
 // still larger than this falls back to a text-only alert so the notification
@@ -595,33 +524,33 @@ func pushPrepare(app *App, camID string, eventType string, title string) pushTic
 	}
 	// Re-arm check after the throttle check: a throttled alert must not
 	// disarm the key (the object would then never be notified).
-	if !pushRearmTake(camID, eventType, now, p.RearmS) {
+	if !rearmTake(rearmPush, camID, eventType, now, p.RearmS) {
 		logIt(LDEBUG, "pushover suppressed (object still present, not re-armed)", map[string]string{"title": title, "camera_id": camID, "type": normalizeDetType(eventType)})
 		return pushTicket{}
 	}
-	var rearmKey string
+	var key string
 	if p.RearmS > 0 && camID != "" {
-		rearmKey = pushRearmKey(camID, eventType)
+		key = rearmKey(camID, eventType)
 	}
 	if p.MinIntervalS > 0 {
 		pushRateMtx.Lock()
 		if lastPushUnix != 0 && now-lastPushUnix < int64(p.MinIntervalS) {
 			// Another alert took the slot in between: give the key back.
 			pushRateMtx.Unlock()
-			pushRearmRestore(rearmKey)
+			rearmRestore(rearmPush, key)
 			return pushTicket{}
 		}
 		reserved = now
 		lastPushUnix = now
 		pushRateMtx.Unlock()
 	}
-	return pushTicket{cfg: p, reserved: reserved, rearmKey: rearmKey, ok: true}
+	return pushTicket{cfg: p, reserved: reserved, rearmKey: key, ok: true}
 }
 
 // rollback releases a reserved throttle slot (and the re-arm key) when the
 // send did not succeed.
 func (t pushTicket) rollback() {
-	pushRearmRestore(t.rearmKey)
+	rearmRestore(rearmPush, t.rearmKey)
 	if t.reserved == 0 {
 		return
 	}

@@ -2357,7 +2357,7 @@ func collectDetectionWithID(app *App, camID string, camName string, src string, 
 	// Vision LLM: register the detection before any async producer starts, so
 	// the analysis runs once the row, the timed snapshot burst and the clip it
 	// needs are all on disk (each producer reports below, success or not).
-	if src != "" && llmAutoActive(app) {
+	if src != "" && llmAutoActive(app) && !detGateMuted(id, rearmLLM) {
 		var ls = app.cfg.LLM.Source
 		var needSnaps = snapOn && (extraCount > 0 || continuous) && llmUsesSnapshots(ls)
 		var needClip = recordOn && app.cfg.Record.Mode == "buffer" && (llmUsesVideo(ls) || !snapOn)

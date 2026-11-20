@@ -156,8 +156,8 @@ See `config.example.yaml` for the full file. Key settings:
 | `record.snapshots.enabled` | Master switch for snapshots (default `true`) |
 | `record.snapshots.count` / `record.snapshots.interval_s` | Snapshots per detection and minimum delay between captures (`count: -1` = shoot while motion is active, capped at 60 shots / 180 s) |
 | `storage.enabled` / `storage.s3.*` | S3-compatible upload (MinIO, R2, …) |
-| `mqtt.*` | MQTT broker connection and event publishing |
-| `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent) |
+| `mqtt.*` | MQTT broker connection and event publishing (`rearm_s`, default 60, 0 = off: once a camera+type was published, its raw events and new detection groups stay silent until that camera has gone `rearm_s` seconds without an event of that type; a tag promotion to an armed type is still published) |
+| `vision.*` | Optional YOLO snapshot analysis via an external `POST /v1/detect` API (async, degraded-silent; `rearm_s`, default 60, 0 = off: new detection groups of an object staying in view are not re-analyzed until that camera has gone `rearm_s` seconds without an event of that type; manual re-analysis is not limited) |
 | `detection.source` | `onvif` (webhook, type only — default), `rtsp` (camera AI boxes + type from H.264 SEI), or `both` |
 | `detection.rtsp.*` | SEI reader tuning: `transport`, `debounce_s`, `hold_s`, `types`, `use_go2rtc` |
 | `alerts.pushover.*` | Pushover notifications (`events` limits which detection types notify — empty means all; `send_snapshot` attaches a compressed copy; `snapshot_pick: best` waits for the burst and attaches the best frame — YOLO class/confidence when `vision.enabled`, else the largest matching SEI box with sharpness fallback; oversized copies fall back to text-only; `rearm_s` (default 60, 0 = off) sends one alert per camera+type until that camera has gone `rearm_s` seconds without an event of that type, so a parked car or a person staying in view does not notify repeatedly). Messages include the detection source (ONVIF/RTSP/manual/test), the camera identification and the YOLO label + confidence when available. |
@@ -644,7 +644,9 @@ After running, review with `git diff --stat` and rebuild via
   not video files. Automatic analysis waits until the snapshot burst and the
   clip are done, runs one request at a time, and pauses for 30 s to 15 min
   after repeated API failures (on-demand requests always run). With a paid
-  API every analyzed detection costs one request: use `llm.events` or
+  API every analyzed detection costs one request: use `llm.events`,
+  `llm.rearm_s` (default 60: an object staying in view is analyzed once until
+  that camera has gone `rearm_s` seconds without an event of its type) or
   `llm.auto: false` to keep it in check.
 - **Detection types are camera-defined.** ONVIF/RTSP are used for detection and
   (ONVIF) PTZ control; detection types are whatever the camera emits (motion /
